@@ -1,0 +1,53 @@
+# Réglages à ajuster sur la vraie piste. Mettre des réels avec un point (0.0, pas 0).
+# Les drapeaux stop_on_checker / stop_on_stop_sign / barrier / priority dépendent
+# de la mission : les forcer en ligne de commande si besoin, pas ici.
+
+track_mission:
+  ros__parameters:
+    image_topic: /camera/image_raw/compressed
+    compressed: true
+    max_speed: 0.12
+    min_speed: 0.05
+    kp: 1.6
+    kd: 2.0
+    max_ang: 1.5
+    stop_sign_area: 0.012       # augmenter = s'arrête plus près du panneau
+    checker_overrun: 0.13       # m parcourus après avoir vu le damier (caméra -> avant du robot)
+    barrier_lidar_dist: 0.22
+    barrier_cam_bottom: 0.45
+    priority_range: 0.70
+    priority_sector_deg: [-110.0, -20.0]
+    lane:
+      roi_top: 0.55
+      yellow_lo: [18, 120, 100]
+      yellow_hi: [40, 255, 255]
+      white_lo: [0, 0, 170]
+      white_hi: [180, 60, 255]
+      lane_width_frac: 0.6
+      center_offset: 0.0
+    red:
+      lo: [170, 110, 70]
+      hi: [10, 255, 255]
+
+enclosure_mission:
+  ros__parameters:
+    speed: 0.15
+    robot_radius: 0.12          # marge normale (demi-largeur 0.089 + 3 cm)
+    min_radius: 0.10            # marge mini quand le robot est bloqué dans un passage étroit
+    door_side_dist: 0.30
+    entrance_goal_deg: 0.0      # direction de l'entrée par rapport au cap de départ (+ = gauche)
+    exit_extra: 0.20
+    detect_entrance_sign: false
+
+storage_mission:
+  ros__parameters:
+    image_topic: /camera/image_raw/compressed
+    compressed: true
+    zones_side: left            # côté des zones par rapport au cap de départ
+    first_zone_dist: 0.20
+    zone_spacing: 0.30
+    approach_dist: 0.20
+    place_extra: 0.0
+    leave_dist: 0.25            # m au-delà de la dernière zone pour sortir de la zone de stockage
+    sign_x_range: [0.25, 0.75]  # bande centrale de l'image où lire le panneau
+    sign_min_score: 0.60
