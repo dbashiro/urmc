@@ -12,19 +12,22 @@ track_mission:
     kd: 2.0
     max_ang: 1.5
     stop_sign_area: 0.012       # augmenter = s'arrête plus près du panneau
-    checker_overrun: 0.13       # m parcourus après avoir vu le damier (caméra -> avant du robot)
+    checker_overrun: 0.06       # m parcourus après avoir vu le damier (caméra -> avant du robot)
     barrier_lidar_dist: 0.22
-    barrier_cam_bottom: 0.45
+    barrier_cam_bottom: 0.45    # bas de la barrière dans l'image (0 haut..1 bas) : plus grand = s'arrête plus près
     priority_range: 0.70
     priority_sector_deg: [-110.0, -20.0]
     lane:
       roi_top: 0.55
-      yellow_lo: [18, 120, 100]
-      yellow_hi: [40, 255, 255]
-      white_lo: [0, 0, 170]
-      white_hi: [180, 60, 255]
+      yellow_lo: [25, 93, 95]       # réglé sur la piste le 05/11 ; V min 118 -> 95 (marge pour les zones sombres)
+      yellow_hi: [90, 255, 242]
+      white_lo: [55, 11, 165]       # réglé sur la piste le 05/11 ; V min 189 -> 165 (sol <= ~130, bande ~200)
+      white_hi: [148, 72, 255]
       lane_width_frac: 0.6
       center_offset: 0.0
+    barrier:                    # couleur de la barrière (planche bleu foncé sur la vraie piste)
+      lo: [90, 120, 20]
+      hi: [130, 255, 170]
     red:
       lo: [170, 110, 70]
       hi: [10, 255, 255]

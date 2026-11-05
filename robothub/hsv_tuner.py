@@ -26,6 +26,7 @@ class HsvTuner(Node):
         self.preset = self.declare_parameter('preset', 'yellow').value
         lo, hi = PRESETS.get(self.preset, ((0, 0, 0), (180, 255, 255)))
         self.img = None
+        self.last = None
         subscribe_camera(self, self.on_image)
         cv2.namedWindow('hsv', cv2.WINDOW_NORMAL)
         for name, v, mx in zip(NAMES, list(lo) + list(hi), [180, 255, 255] * 2):
@@ -40,6 +41,13 @@ class HsvTuner(Node):
         return tuple(v[:3]), tuple(v[3:])
 
     def show(self):
+        # fenêtre fermée avec la croix : on affiche les dernières valeurs et on quitte proprement
+        if cv2.getWindowProperty('hsv', cv2.WND_PROP_VISIBLE) < 1:
+            if self.last is not None:
+                print(f'{self.preset}: lo: {list(self.last[0])}  hi: {list(self.last[1])}  (fenêtre fermée)',
+                      flush=True)
+            raise KeyboardInterrupt
+        self.last = self.values()
         if self.img is not None:
             img = resize_to_width(self.img, 480)
             lo, hi = self.values()

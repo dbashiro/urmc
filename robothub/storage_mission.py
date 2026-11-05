@@ -86,6 +86,7 @@ class StorageMission(Node):
         self.zone_labels = list(dp('zone_labels', ['zone1', 'zone2', 'zone3']))
         templates = dp('templates_dir', '~/ros2_ws/src/robothub/templates')
         self.start_delay = dp('start_delay', 1.0)
+        self.sensor_timeout = dp('sensor_timeout', 0.6)  # s sans odométrie -> pause
 
         self.classifier = SignClassifier(templates)
         missing = [z for z in self.zone_labels if z not in self.classifier.labels]
@@ -108,6 +109,8 @@ class StorageMission(Node):
         self.aisle_yaw = None
         self.approach = None
         self.started = False
+        self.scan_filter = lidar.ScanFilter()
+        self.odom_t = -1e9
         self.t0 = self.now()
         self.create_timer(0.05, self.control)
 
@@ -119,13 +122,14 @@ class StorageMission(Node):
         self.img_count += 1
 
     def on_scan(self, msg):
-        r, a = lidar.scan_arrays(msg)
+        r, a = self.scan_filter(msg, self.now(), self.ctx.yaw)
         self.ctx.front_min = lidar.sector_min(r, a, -10, 10)
 
     def on_odom(self, msg):
         p = msg.pose.pose.position
         self.ctx.x, self.ctx.y = p.x, p.y
         self.ctx.yaw = yaw_from_quat(msg.pose.pose.orientation)
+        self.odom_t = self.now()
 
     # ------------------------------------------------------------------ plans
     def zone_pos(self, i):
@@ -199,6 +203,10 @@ class StorageMission(Node):
         self.ctx.now = self.now()
         if not self.ctx.ready:
             return
+        if self.ctx.now - self.odom_t > self.sensor_timeout:
+            # les étapes sont en boucle fermée sur l'odométrie : on les met en pause, elles reprendront
+            self.get_logger().warn('odométrie muette -> pause', throttle_duration_sec=1.0)
+            return self.drive(0.0, 0.0)
         if not self.started:
             self.drive(0.0, 0.0)
             if self.ctx.now - self.t0 < self.start_delay:

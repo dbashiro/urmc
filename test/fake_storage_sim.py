@@ -1,8 +1,11 @@
 """Simulateur 2D minimal (cinématique + caméra + aimant) pour tester storage_mission sans Gazebo.
 
     python3 test/fake_storage_sim.py --make-templates DIR    (une fois : modèles zone1/2/3)
-    python3 test/fake_storage_sim.py [--seed N] [--view]      (en parallèle de storage_mission
-                                                               lancé avec templates_dir:=DIR)
+    python3 test/fake_storage_sim.py [--seed N] [--level ideal|real|hard] [--view]
+                                         (en parallèle de storage_mission lancé avec templates_dir:=DIR)
+
+--level : réalisme (voir sim_core.py), « real » par défaut. En plus du robot et de la caméra,
+          les zones sont décalées de ±1 cm de leur position nominale et le départ est imparfait.
 
 --view : fenêtre vue de dessus (zones et numéros, palette, robot, aimant) + image caméra.
 
@@ -25,8 +28,11 @@ from geometry_msgs.msg import Twist
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Bool
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import sim_core  # noqa: E402
+
 ROBOT_FRONT = 0.09             # avant du burger (aimant) par rapport au centre
-ZONE_X = [0.20, 0.50, 0.80]    # centres des zones le long de l'allée
+ZONE_X = [0.20, 0.50, 0.80]    # centres nominaux des zones le long de l'allée (décalés selon --level)
 ZONE_Y = 0.365                 # centre des zones : face avant de la palette à y = 0.29
 ZONE_HALF = (0.10, 0.10)       # demi-dimensions des zones (x, y)
 PALLET_HALF = 0.075
@@ -55,10 +61,17 @@ def make_templates(path):
 
 
 class Sim(Node):
-    def __init__(self, order):
+    def __init__(self, order, level, rng):
         super().__init__('fake_storage_sim')
+        global ZONE_X
         self.order = order                      # order[i] = numéro de la zone en position i
-        self.x, self.y, self.yaw = 0.0, 0.0, 0.0
+        self.level, self.rng = level, rng
+        if level.name != 'ideal':
+            ZONE_X = [z + rng.uniform(-0.01, 0.01) for z in ZONE_X]
+        x, y, yaw = sim_core.start_pose(0.0, 0.0, 0.0, level, rng)
+        self.robot = sim_core.Robot(x, y, yaw, level, rng)
+        self.cam = sim_core.Camera(level, rng)
+        self.x, self.y, self.yaw = x, y, yaw
         self.v = self.w = 0.0
         self.t = 0.0
         p1 = order.index(1)
@@ -81,8 +94,7 @@ class Sim(Node):
             self.create_timer(0.1, self.draw)
 
     def on_cmd(self, m):
-        self.v = max(-0.22, min(0.22, m.linear.x))
-        self.w = max(-2.84, min(2.84, m.angular.z))
+        self.robot.command(m.linear.x, m.angular.z)
 
     def on_magnet(self, m):
         self.magnet = m.data
@@ -97,9 +109,9 @@ class Sim(Node):
     def step(self):
         dt = 0.02
         self.t += dt
-        self.yaw += self.w * dt
-        self.x += self.v * math.cos(self.yaw) * dt
-        self.y += self.v * math.sin(self.yaw) * dt
+        r = self.robot
+        r.step(dt)
+        self.x, self.y, self.yaw, self.v, self.w = r.x, r.y, r.yaw, r.v, r.w
         if '--trace' in sys.argv and round(self.t / dt) % 50 == 0:
             print(f't={self.t:4.1f} x={self.x:+.2f} y={self.y:+.2f} yaw={math.degrees(self.yaw):+5.0f} '
                   f'v={self.v:+.2f} w={self.w:+.2f} aimant={self.magnet}', flush=True)
@@ -128,10 +140,7 @@ class Sim(Node):
                     self.crossed.add(n)
         if self.t > 180:
             self.end(f'TIMEOUT position ({self.x:.2f}, {self.y:.2f})')
-        o = Odometry()
-        o.pose.pose.position.x, o.pose.pose.position.y = self.x, self.y
-        o.pose.pose.orientation.z, o.pose.pose.orientation.w = math.sin(self.yaw / 2), math.cos(self.yaw / 2)
-        self.odom_pub.publish(o)
+        self.odom_pub.publish(r.odom_msg())
         self.check_done()
 
     def check_done(self):
@@ -154,10 +163,10 @@ class Sim(Node):
                  f'sorti={left_area} robot=({self.x:.2f}, {self.y:.2f})')
 
     def publish_image(self):
-        m = CompressedImage()
-        m.format = 'jpeg'
-        m.data = cv2.imencode('.jpg', self.camera(), [cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes()
-        self.img_pub.publish(m)
+        self.cam.push(self.t, self.cam.effects(self.camera(), self.t, self.w))
+        img = self.cam.pop(self.t)
+        if img is not None:
+            self.img_pub.publish(sim_core.jpeg(img))
 
     def camera(self):
         img = np.full((IMG_H, IMG_W, 3), 30, np.uint8)  # moquette sombre
@@ -173,7 +182,7 @@ class Sim(Node):
             if px < 6 or x0 < 0 or y0 < 0 or x0 + px > IMG_W or y0 + px > IMG_H:
                 continue
             img[y0:y0 + px, x0:x0 + px] = render_sign(n, px)
-        return cv2.add(img, np.random.randint(0, 12, img.shape, np.uint8))  # bruit capteur
+        return img  # bruit, éclairage, flou : sim_core.Camera
 
     def draw(self):
         v = self.view
@@ -208,11 +217,14 @@ def main():
     if '--make-templates' in sys.argv:
         make_templates(sys.argv[sys.argv.index('--make-templates') + 1])
         return
-    seed = int(sys.argv[sys.argv.index('--seed') + 1]) if '--seed' in sys.argv else 0
-    order = [int(v) for v in np.random.default_rng(seed).permutation([1, 2, 3])]
+    seed = sim_core.seed_from_argv(sys.argv)
+    level = sim_core.level_from_argv(sys.argv)
+    rng = np.random.default_rng(seed)
+    order = [int(v) for v in rng.permutation([1, 2, 3])]
     rclpy.init()
-    node = Sim(order)
-    print('zones (positions 0, 1, 2) :', order, flush=True)
+    node = Sim(order, level, rng)
+    print(f'zones (positions 0, 1, 2) : {order} | niveau={level.name} seed={seed} '
+          f'centres x={[round(z, 3) for z in ZONE_X]}', flush=True)
     try:
         rclpy.spin(node)
     except SystemExit as e:

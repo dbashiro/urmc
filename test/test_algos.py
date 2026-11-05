@@ -58,26 +58,46 @@ def test_checker():
     assert det.process(img).checker
 
 
-def test_stop_sign_and_barrier():
+NAVY = (61, 30, 6)  # BGR de la vraie barrière (planche bleu foncé)
+
+
+def test_stop_sign():
     rp = vision.RedParams()
     img = track_image(0)
     cv2.circle(img, (250, 60), 22, RED, -1)
     cv2.rectangle(img, (235, 55), (265, 65), WHITE, -1)  # barre blanche du sens interdit
     assert vision.detect_stop_sign(img, rp) > 0.01
-    assert vision.detect_barrier(img, rp) is None
-
-    bar = track_image(0)
-    for i, x in enumerate(range(60, 260, 25)):  # barrière rayée rouge / blanc
-        cv2.rectangle(bar, (x, 130), (x + 24, 142), RED if i % 2 == 0 else WHITE, -1)
-    bottom = vision.detect_barrier(bar, rp)
-    assert bottom is not None and 0.55 < bottom < 0.62
-    assert vision.detect_stop_sign(bar, rp) == 0.0
-
-    square = track_image(0)  # rayures presque carrées (barrière vue de loin) : pas un panneau
+    square = track_image(0)  # rayures presque carrées : pas un panneau
     for i, x in enumerate(range(40, 280, 30)):
         cv2.rectangle(square, (x, 90), (x + 29, 115), RED if i % 2 == 0 else WHITE, -1)
     assert vision.detect_stop_sign(square, rp) == 0.0
-    assert vision.detect_barrier(square, rp) is not None
+
+
+def test_barrier_board_with_legs():
+    bp = vision.BarrierParams()
+    img = track_image(0)
+    cv2.circle(img, (250, 60), 22, RED, -1)           # panneau rouge : pas une barrière
+    assert vision.detect_barrier(img, bp) is None
+    legs = track_image(0)                              # pieds seuls (barrière levée) : rien
+    cv2.rectangle(legs, (20, 100), (40, 230), NAVY, -1)
+    cv2.rectangle(legs, (280, 100), (300, 230), NAVY, -1)
+    assert vision.detect_barrier(legs, bp) is None
+    bar = legs.copy()                                  # planche + pieds collés : bas de la planche
+    cv2.rectangle(bar, (0, 100), (319, 150), NAVY, -1)
+    bottom = vision.detect_barrier(bar, bp)
+    assert bottom is not None and abs(bottom - 151 / 240) < 0.02
+    lifted = legs.copy()                               # planche levée en biais : plus une barrière
+    cv2.line(lifted, (30, 110), (200, 0), NAVY, 12)
+    assert vision.detect_barrier(lifted, bp) is None
+
+
+def test_barrier_red_config():
+    bp = vision.BarrierParams(lo=(170, 110, 70), hi=(10, 255, 255))  # barrière rouge : teinte qui fait le tour
+    bar = track_image(0)
+    for i, x in enumerate(range(0, 320, 25)):
+        cv2.rectangle(bar, (x, 130), (x + 24, 142), RED if i % 3 else WHITE, -1)
+    assert vision.detect_barrier(bar, bp) is not None
+    assert vision.detect_barrier(bar, vision.BarrierParams()) is None  # bleue par défaut
 
 
 def test_sign_classifier(tmp_path):
@@ -150,3 +170,102 @@ def test_sequencer_drive_and_rotate():
             break
     assert seq.idle
     assert abs(ctx.x - 0.3) < 0.01 and abs(ctx.yaw - math.pi / 2) < 0.03
+
+
+def _lds(dist_fn):
+    """Comme le LDS-01 : 0 sous range_min (12 cm) et sans écho."""
+    return make_scan(lambda ang: 0.0 if dist_fn(ang) < 0.12 or dist_fn(ang) > 3.5 else dist_fn(ang))
+
+
+def test_scan_zero_next_to_close_echo_is_close():
+    # mur à gauche, si proche que le centre du secteur est sous range_min (0 = « trop près »)
+    def d(ang):
+        deg = math.degrees(ang)
+        if 80 <= deg <= 100:
+            return 0.08
+        if 60 <= deg <= 120:
+            return 0.15
+        return 5.0
+    r, a = lidar.scan_arrays(_lds(d))
+    deg = np.degrees(a)
+    assert r[np.argmin(np.abs(deg - 81))] <= 0.12  # 0 voisin d'un écho proche -> proche
+    assert r[np.argmin(np.abs(deg + 90))] > 3.0    # 0 sans voisin proche -> libre
+
+
+def test_scan_filter_holds_beam_that_went_too_close():
+    f = lidar.ScanFilter(hold_near=0.30, hold_time=2.0)
+    r, _ = f(_lds(lambda ang: 0.20), 0.0)          # mur à 20 cm tout autour
+    r, a = f(_lds(lambda ang: 0.05), 0.5)          # trop près partout : que des 0
+    assert r.max() <= 0.12                         # mémoire : toujours un mur
+    r, _ = f(_lds(lambda ang: 0.05), 3.0)          # mémoire expirée
+    assert r.min() > 3.0
+    r, _ = f(_lds(lambda ang: 5.0), 3.5)           # loin + pas d'écho -> libre
+    assert r.min() > 3.0
+
+
+def test_scan_filter_follows_rotation():
+    # mur collé à gauche (+90°), puis le robot tourne de +90° vers lui et le mur passe sous range_min :
+    # la mémoire doit le retrouver devant (0°), et non plus à +90° (qui regarde maintenant ailleurs)
+    f = lidar.ScanFilter(hold_near=0.20, hold_time=1.0)
+    near_left = lambda ang: 0.15 if abs(math.degrees(ang) - 90) < 10 else 5.0  # noqa: E731
+    f(_lds(near_left), 0.0, yaw=0.0)
+    r, a = f(_lds(lambda ang: 5.0), 0.2, yaw=math.pi / 2)
+    deg = np.degrees(a)
+    assert r[np.argmin(np.abs(deg))] <= 0.12
+    assert r[np.argmin(np.abs(deg - 90))] > 3.0
+
+
+def test_sim_core_robot_latency_accel_and_drift():
+    import sys
+    sys.path.insert(0, 'test')
+    import sim_core
+    rng = np.random.default_rng(0)
+    r = sim_core.Robot(0.0, 0.0, 0.0, sim_core.LEVELS['real'], rng)
+    r.command(0.2, 0.0)
+    r.step(0.02)
+    assert r.v == 0.0                    # retard de commande
+    for _ in range(5):
+        r.step(0.02)
+    assert 0.0 < r.v < 0.2               # accélération limitée
+    for _ in range(500):
+        r.step(0.02)
+    assert abs(r.v - 0.2) < 1e-9
+    assert abs(r.ox - r.x) < 0.1 and math.hypot(r.ox - r.x, r.oy - r.y) > 1e-4  # odométrie qui dérive
+
+
+def test_sim_core_lidar_like_lds01():
+    import sys
+    sys.path.insert(0, 'test')
+    import sim_core
+    out = sim_core.lidar_effects([0.05, 1.0, math.inf, 5.0], sim_core.LEVELS['ideal'], np.random.default_rng(0))
+    assert out == [0.0, 1.0, 0.0, 0.0]   # trop près / écho / rien / trop loin
+
+
+def test_lane_ignores_yellow_on_the_right_and_follows_only_yellow():
+    """Carrefour (figure 3) : un arrondi jaune apparaît à DROITE ; la jaune de notre route est à gauche."""
+    p = vision.LaneParams(only='yellow')
+    det = vision.LaneDetector(p)
+    for _ in range(12):  # apprentissage de la largeur avec les deux bandes
+        det.process(track_image(0))
+    img = track_image(0, white=False)
+    cv2.line(img, (300, 239), (319, 180), YELLOW, 8)   # jaune parasite à droite
+    r = det.process(img)
+    assert r.found and abs(r.error) < 0.1               # toujours centré sur la piste
+    shifted = track_image(40)                           # en mode « jaune seule », la blanche n'est plus utilisée
+    cv2.line(shifted, (250, 239), (250, 120), (0, 0, 0), 30)
+    assert det.process(shifted).error > 0.1
+
+
+def test_lane_any_color_handles_swapped_colors():
+    """Après un carrefour tout droit, la route d'en face a les couleurs inversées (figure 3)."""
+    def swapped(shift):
+        img = track_image(shift)
+        y = np.all(img == YELLOW, axis=2)
+        wht = np.all(img == WHITE, axis=2)
+        img[y], img[wht] = WHITE, YELLOW
+        return img
+    det = vision.LaneDetector(vision.LaneParams(any_color=True, prefer='none'))
+    for _ in range(10):
+        det.process(track_image(0))
+    assert abs(det.process(swapped(0)).error) < 0.05
+    assert det.process(swapped(50)).error > 0.15 and det.process(swapped(-50)).error < -0.15

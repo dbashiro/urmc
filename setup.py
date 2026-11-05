@@ -29,6 +29,8 @@ setup(
             'electromagnet = robothub.electromagnet_node:main',
             'hsv_tuner = robothub.hsv_tuner:main',
             'capture_templates = robothub.capture_templates:main',
+            'camera_web = robothub.camera_web:main',
+            'control_panel = robothub.control_panel:main',
         ],
     },
 )

@@ -9,6 +9,7 @@ Un nœud par famille d'épreuves du règlement. Tous les réglages sont dans
 | 0. Virage + arrêt au panneau STOP              | `ros2 launch robothub track.launch.py mission:=curve` |
 | 1. Barrière : arrêt puis reprise               | `ros2 launch robothub track.launch.py mission:=barrier` |
 | 2. Intersection, priorité à droite             | `ros2 launch robothub track.launch.py mission:=intersection` |
+| 0 + 1 + 2 enchaînées (parcours complet)        | `ros2 launch robothub track.launch.py mission:=parcours` |
 | 4. Enclos (LiDAR seul, caméra interdite)       | `ros2 launch robothub enclosure.launch.py` |
 | 5. Palette zone ① → zone ②                     | `ros2 launch robothub storage.launch.py` (+ `ros2 run robothub electromagnet` **sur le robot**) |
 
@@ -22,8 +23,73 @@ jury la voie. Ctrl+C arrête le robot et coupe l'aimant.
 cd ~/ros2_ws && colcon build --symlink-install && source install/setup.bash
 ```
 
-Sur le robot : `ros2 launch turtlebot3_bringup robot.launch.py` et la caméra (topic
-`/camera/image_raw/compressed`), même `ROS_DOMAIN_ID` (30) des deux côtés.
+Robot n°9 : `192.168.42.209`, wifi `c138proj` (pas de DHCP : IP fixe sur le PC),
+`ROS_DOMAIN_ID=39` des deux côtés. **`~/robot.sh` fait tout** : wifi, bringup + caméra
+(`/camera/image_raw/compressed`) sur le robot par SSH, puis ouvre le Docker avec le bon
+domaine. `CAMERA=0 ~/robot.sh` pour l'enclos (caméra interdite), `~/robot.sh off` pour
+éteindre le Pi.
+
+## Panneau de contrôle (tout au même endroit)
+
+```bash
+~/robot.sh            # une fois : wifi + bringup + caméra sur le robot
+~/robot.sh panel      # puis le panneau : http://localhost:8080 (s'ouvre tout seul)
+```
+(dans le Docker : `ros2 run robothub control_panel`)
+
+- **Vidéo** : caméra, *Debug mission* (bandes détectées, état), masques jaune / blanc / rouge ;
+  largeur, qualité, images/s réglables ; bouton photo.
+- **Mission** : choisir l'épreuve, régler (vitesse, kp, kd, …, préremplis depuis le YAML),
+  ▶ Lancer, logs en direct. **STOP = gros bouton rouge ou barre d'espace.**
+  « Enregistrer ces réglages » les écrit dans `config/robothub.yaml` (commentaires conservés).
+- **Vision** : onglet *Masque …* → curseurs HSV, résultat en direct, « Enregistrer dans le YAML ».
+  Remplace `hsv_tuner`.
+- **Pilotage manuel** : flèches (maintenir), désactivé pendant une mission.
+- En haut : voyants robot / LiDAR / caméra (débit), tension batterie, vitesse.
+
+La qualité JPEG côté robot (ce qui passe en Wi-Fi) : `JPEG_QUALITY=40 ~/robot.sh` (50 par
+défaut, ~6 Ko par image en 320x240). Enclos : `CAMERA=0 ~/robot.sh` (caméra interdite).
+
+## Sécurités (toutes missions)
+
+- **LiDAR sous 12 cm** : le LDS-01 renvoie 0 quand un objet est trop près, comme quand il
+  n'y a rien. Un 0 à côté d'un écho très proche, ou sur un faisceau qui voyait un objet
+  collé juste avant (mémoire 0,6 s qui suit la rotation), est traité comme un obstacle.
+  Les simulateurs reproduisent ce comportement.
+- **Capteur muet** : plus de LiDAR/odométrie depuis `sensor_timeout` (0,6 s) -> arrêt (enclos),
+  pause de la séquence (stockage), LiDAR ignoré et arrêt en priorité à droite (piste).
+- **Piste** : arrêt si un obstacle est à moins de `front_guard_dist` (15 cm) devant ; le terme D
+  est ramené à `kd_period` (1/15 s), donc même comportement que la caméra tourne à 10 ou 30 i/s.
+
+## Parcours complet (les 4 premières épreuves d'un coup)
+
+Panneau : « Parcours complet », ou `ros2 launch robothub track.launch.py mission:=parcours`.
+Suivi de ligne + arrêt à la barrière et reprise + carrefour (priorité à droite, traversée tout
+droit) + arrêt au panneau STOP. Les damiers sont franchis (`checker_count:=0`) ; mettre
+`checker_count:=N` pour s'arrêter au N-ième. La priorité à droite et la manœuvre de carrefour ne
+s'activent qu'à l'approche d'un carrefour (bandes qui s'ouvrent des deux côtés), pas sur tout le
+parcours. Simulateur : scénarios `parcours` et `parcours-priorite` (ordre de la figure 3 :
+barrière, carrefour, route d'en face aux couleurs inversées, virage, STOP).
+
+## Enclos puis suivi de ligne
+
+Panneau : mission « Enclos (LiDAR) puis suivi de ligne ». Lance `enclosure_mission handoff:=true`
+et `track_mission start_topic:=/robothub/enclosure_done` (mission straight : s'arrête au damier).
+Dans l'enclos, seul le LiDAR pilote ; le suivi de ligne **ne s'abonne pas à la caméra** avant
+d'avoir reçu le signal de sortie (5 cm après la porte, `exit_extra`). La caméra doit donc tourner
+sur le robot (`~/robot.sh`, pas `CAMERA=0`) — **à faire valider par le jury**.
+Si la piste est perdue, le suivi pivote de ±`search_deg` (35°) pour la retrouver avant de s'arrêter.
+
+## Carrefour (épreuve 2, figure 3 du règlement)
+
+Il faut **traverser tout droit**. D'après la figure, sur la route d'en face les couleurs sont
+inversées : en mission `intersection`, le robot suit donc la bande de gauche et la bande de
+droite **sans regarder leur couleur** (`lane.any_color`). À l'approche du carré central, les
+bandes s'écartent (l'une part à gauche, l'autre à droite) : seule la piste avant l'écartement
+compte, le robot reste droit. Quand les bandes raccourcissent puis disparaissent (dans le
+carré), il avance au cap de la route (odométrie) jusqu'à retrouver les bandes d'en face
+(au moins `cross_straight_min`, au plus `cross_straight` m). Priorité à droite (LiDAR) avant.
+`cross_turn:=left|right` si un jour il faut tourner (arc de 90°, `cross_pre`, `cross_radius`).
 
 ## À faire sur la vraie piste (avant la qualification)
 
@@ -51,27 +117,65 @@ cd ~/ros2_ws/src/robothub
 python3 -m pytest test/                 # algorithmes sur images / scans de synthèse
 ```
 
-Trois simulateurs 2D légers (pas besoin de Gazebo), à lancer en parallèle de la mission :
+### Centre de simulation (recommandé)
+
+```bash
+test/sim_hub.sh                    # interface graphique (depuis le PC, lance tout dans Docker)
+test/sim_hub.sh --batch --seeds 5  # campagne en terminal, tableau récapitulatif à la fin
+test/sim_hub.sh --run enclos-aleatoire --seed 4 --level hard --view   # rejouer un essai
+```
+
+- **Gauche, un essai** : scénario, seed, réalisme, avec la vue de dessus en direct et le log.
+- **Droite, une campagne** : scénarios × seeds × niveaux, en parallèle, avec un tableau
+  vert/rouge. Double-clic sur une ligne pour la rejouer avec la vue, clic droit pour ses logs.
+- Résultats et logs dans `test/results/<date>/` (`results.csv`).
+- Chaque essai a son propre `ROS_DOMAIN_ID` (60-99) + `ROS_LOCALHOST_ONLY=1` : aucun risque
+  de piloter le vrai robot, même allumé.
+
+Scénarios : `piste-droite`, `piste-virage`, `piste-aleatoire` (tracés en S tirés au hasard),
+`barriere`, `intersection`, `enclos-fixe` (figure 4), `enclos-aleatoire` (taille, entrée,
+sortie en bas/droite/haut ; on vérifie qu'un chemin existe), `stockage`.
+
+**Niveaux de réalisme** (`test/sim_core.py`) :
+
+| | ideal | real (défaut) | hard |
+|---|---|---|---|
+| accélération (lin / ang) | instantanée | 0.8 m/s² / 5 rad/s² | 0.5 / 3.5 |
+| retard de commande | 0 | 60 ms | 150 ms |
+| erreur d'échelle des roues (odométrie qui dérive) | 0 | ±1.5 % | ±3 % |
+| LiDAR bruit / faisceaux perdus | 0 | 8 mm / 2 % | 15 mm / 6 % |
+| caméra : retard / images perdues | 0 | 100 ms / 5 % | 200 ms / 12 % |
+| caméra : éclairage, flou de bougé, bruit | non | oui | fort |
+| placement au départ | parfait | ±1.5 cm, ±3° | ±3 cm, ±6° |
+
+Le verdict se fait sur la **vraie** position ; les missions ne reçoivent que l'odométrie (qui
+part de 0 et dérive) et des capteurs imparfaits, comme sur le robot.
+
+### Simulateurs à la main
+
+Les trois simulateurs se lancent aussi à la main, en parallèle de la mission :
 
 ```bash
 # suivi de piste, caméra virtuelle (piste de 20 cm, bandes jaune/blanche, damier, panneau)
 ros2 launch robothub track.launch.py mission:=straight &  python3 test/fake_track_sim.py straight
 ros2 launch robothub track.launch.py mission:=curve &     python3 test/fake_track_sim.py curve
+ros2 launch robothub track.launch.py mission:=straight &  python3 test/fake_track_sim.py random --seed 4
 ros2 launch robothub track.launch.py mission:=barrier &   python3 test/fake_track_sim.py straight --barrier
 ros2 launch robothub track.launch.py mission:=intersection &  python3 test/fake_track_sim.py straight --robot-right
-# enclos avec obstacles aléatoires
+# enclos (aléatoire avec --seed, celui du règlement avec --layout fixed)
 ros2 launch robothub enclosure.launch.py &                python3 test/fake_enclosure_sim.py --seed 3
 # palette : générer d'abord des modèles de panneaux de synthèse
 python3 test/fake_storage_sim.py --make-templates /tmp/tpl
 ros2 run robothub storage_mission --ros-args -p templates_dir:=/tmp/tpl &  python3 test/fake_storage_sim.py --seed 2
 ```
 
-Options des simulateurs : `--offset M` / `--yaw DEG` (départ décalé), `--trace` (position
-toutes les secondes). Chacun affiche `SUCCESS` ou la cause de l'échec.
+Options communes : `--level ideal|real|hard`, `--seed N`, `--view`, `--trace` ; piste :
+`--offset M` / `--yaw DEG`. Chacun affiche `SUCCESS` ou la cause de l'échec. **Attention** :
+à la main, sans `ROS_LOCALHOST_ONLY=1` et un autre domaine, ils parlent au vrai robot s'il
+est allumé — préférer `sim_hub`.
 
-Limites des simulateurs : sol parfaitement plat, éclairage uniforme, odométrie sans
-glissement, panneaux de synthèse. Ils valident la logique, pas les réglages : ceux-ci se
-font sur la vraie piste (liste ci-dessus).
+Limites : sol plat, pas de glissement latéral, panneaux et pistes de synthèse. Les niveaux
+real/hard rendent les tests plus honnêtes mais ne remplacent pas les réglages sur la vraie piste.
 
 ### Voir les simulations
 

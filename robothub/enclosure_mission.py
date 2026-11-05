@@ -9,7 +9,9 @@ rayon `robot_radius`), puis on choisit la meilleure direction selon la phase :
           plus loin que `open_range` (au-delà des murs), hors secteur de l'entrée.
           Sa direction est mémorisée si elle est momentanément cachée par un obstacle.
           Sans sortie visible : direction la plus dégagée.
-  EXIT    une fois sorti, avance de `exit_extra` m puis s'arrête
+  EXIT    une fois sorti, avance de `exit_extra` m puis s'arrête — ou, avec handoff:=true,
+          publie True sur `handoff_topic` et ne pilote plus : track_mission (lancée avec
+          start_topic) prend la main pour reprendre le suivi de ligne
 
 Entrée : détectée quand il y a un mur proche à gauche ET à droite en même temps
 (montants de la porte), puis qu'ils disparaissent.
@@ -69,6 +71,8 @@ class EnclosureMission(Node):
         self.wall_range = dp('wall_accumulate_range', 1.0)  # points mémorisés comme « murs » si plus proches
         self.exit_margin = dp('exit_margin', 0.05)          # m hors de l'enveloppe pour déclarer la sortie
         self.time_limit = dp('time_limit', 120.0)
+        self.handoff = dp('handoff', False)            # true : à la sortie, passer la main au suivi de ligne
+        self.handoff_topic = dp('handoff_topic', '/robothub/enclosure_done')
         self.start_delay = dp('start_delay', 1.0)
         self.verbose = dp('verbose', False)
         self.detect_sign = dp('detect_entrance_sign', False)
@@ -78,6 +82,11 @@ class EnclosureMission(Node):
 
         self.dirs = np.radians(np.arange(-math.degrees(self.max_dir), math.degrees(self.max_dir) + 0.1, 3.0))
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        from rclpy.qos import DurabilityPolicy, QoSProfile
+        from std_msgs.msg import Bool
+        self.Bool = Bool
+        self.done_pub = self.create_publisher(  # « latché » : reçu même par un abonné arrivé après
+            Bool, self.handoff_topic, QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.create_subscription(LaserScan, '/scan', self.on_scan, qos_profile_sensor_data)
         self.create_subscription(Odometry, '/odom', self.on_odom, 10)
         self.beeper = Beeper(self)
@@ -91,6 +100,9 @@ class EnclosureMission(Node):
 
         self.scan = None
         self.pose = None
+        self.scan_filter = lidar.ScanFilter()
+        self.scan_t = self.odom_t = -1e9
+        self.sensor_timeout = dp('sensor_timeout', 0.6)  # s sans scan/odom -> arrêt
         self.state = 'SIGN' if self.detect_sign else 'START'
         self.t0 = self.now()
         self.t_start = None
@@ -102,6 +114,7 @@ class EnclosureMission(Node):
         self.dist = 0.0
         self.dist_at_exit = None
         self.radius = self.robot_radius
+        self.diag = ''
         self.progress = None                            # (t, x, y) du dernier vrai déplacement
         self.squeeze_xy = None
         self.wall_pts = np.zeros((0, 2), np.float32)
@@ -114,13 +127,15 @@ class EnclosureMission(Node):
         return self.get_clock().now().nanoseconds * 1e-9
 
     def on_scan(self, msg):
-        self.scan = lidar.scan_arrays(msg)
+        self.scan_t = self.now()
+        self.scan = self.scan_filter(msg, self.scan_t, None if self.pose is None else self.pose[2])
 
     def on_odom(self, msg):
         p = msg.pose.pose.position
         if self.pose is not None and self.state in ('ENTER', 'INSIDE', 'EXIT'):
             self.dist += math.hypot(p.x - self.pose[0], p.y - self.pose[1])
         self.pose = (p.x, p.y, yaw_from_quat(msg.pose.pose.orientation))
+        self.odom_t = self.now()
 
     def on_image(self, msg):
         if self.state != 'SIGN':
@@ -137,9 +152,14 @@ class EnclosureMission(Node):
 
     # ------------------------------------------------------------------
     def control(self):
+        if self.state == 'HANDOFF':
+            return  # le suivi de ligne pilote, on ne publie plus rien
         if self.scan is None or self.pose is None or self.state in ('SIGN', 'DONE'):
             return self.drive(0.0, 0.0)
         now = self.now()
+        if now - self.scan_t > self.sensor_timeout or now - self.odom_t > self.sensor_timeout:
+            self.get_logger().warn('LiDAR ou odométrie muet -> arrêt', throttle_duration_sec=1.0)
+            return self.drive(0.0, 0.0)
         yaw = self.pose[2]
         if self.state == 'START':
             if now - self.t0 < self.start_delay:
@@ -156,7 +176,7 @@ class EnclosureMission(Node):
         if self.state == 'INSIDE':
             self.check_exit(r, a, now)
         if self.state == 'EXIT' and self.dist - self.dist_at_exit >= self.exit_extra:
-            return self.finish()
+            return self.finish(handoff=self.handoff)
 
         self.update_radius(now)
         free = lidar.free_distance(r, a, self.dirs, self.radius, self.cap)
@@ -182,15 +202,22 @@ class EnclosureMission(Node):
             score = score - self.w_smooth * np.abs(d)
         score[free < self.min_free] = -np.inf
 
+        near = {k: lidar.sector_min(r, a, lo, hi) for k, (lo, hi) in
+                {'devant': (-20, 20), 'gauche': (20, 110), 'droite': (-110, -20)}.items()}
+        self.diag = (f'{self.state} marge={self.radius:.2f} libre tout droit={float(free[np.argmin(np.abs(self.dirs))]):.2f} m '
+                     f'libre max={float(free.max()):.2f} m vers {math.degrees(float(self.dirs[int(np.argmax(free))])):+.0f}° | '
+                     f'plus proche : devant {near["devant"]:.2f}, gauche {near["gauche"]:.2f}, droite {near["droite"]:.2f} m')
         if not np.isfinite(score).any():
             # coincé : on tourne sur place vers le côté le plus dégagé
             left = lidar.sector_min(r, a, 30, 150)
             right = lidar.sector_min(r, a, -150, -30)
+            self.diag += f' | aucune direction assez libre (> {self.min_free:.2f} m) -> pivote sur place'
             if self.verbose:
                 self.get_logger().info(f'{self.state} coincé free_max={free.max():.2f}', throttle_duration_sec=1.0)
             return self.drive(0.0, self.max_ang * (1 if left > right else -1))
 
         i = int(np.argmax(score))
+        self.diag += f' | choix {math.degrees(float(self.dirs[i])):+.0f}°'
         th = float(self.dirs[i])
         self.last_choice = wrap(yaw + th)
         ahead = float(free[np.argmin(np.abs(self.dirs))])
@@ -212,7 +239,7 @@ class EnclosureMission(Node):
             self.radius = max(self.min_radius, self.radius - 0.01)
             self.progress = (now, x, y)
             self.squeeze_xy = (x, y)
-            self.get_logger().info(f'bloqué : marge réduite à {self.radius:.3f} m')
+            self.get_logger().info(f'bloqué : marge réduite à {self.radius:.3f} m  [{self.diag}]')
         # marge normale rétablie une fois le passage franchi
         if self.radius < self.robot_radius and math.hypot(x - self.squeeze_xy[0], y - self.squeeze_xy[1]) > 0.25:
             self.radius = self.robot_radius
@@ -274,8 +301,14 @@ class EnclosureMission(Node):
         self.get_logger().info(f'{self.state} -> {s} (portes franchies : {self.doors}, {self.dist:.2f} m)')
         self.state = s
 
-    def finish(self):
+    def finish(self, handoff=False):
         self.drive(0.0, 0.0)
+        if handoff:
+            self.beeper.beep(1)
+            self.done_pub.publish(self.Bool(data=True))
+            self.get_logger().info('enclos terminé -> suivi de ligne')
+            self.set_state('HANDOFF')
+            return
         self.beeper.beep(4)
         self.set_state('DONE')
 

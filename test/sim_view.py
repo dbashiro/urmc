@@ -2,7 +2,8 @@
 
 Repère monde en mètres, x à droite, y en haut. Si aucun affichage n'est disponible
 (pas de DISPLAY), la fenêtre est désactivée avec un message et la simulation continue.
-SIM_VIEW_DUMP=dossier : enregistre une image toutes les 2 s au lieu d'afficher (sans écran).
+SIM_VIEW_DUMP=dossier : enregistre une image toutes les 2 s au lieu d'afficher (sans écran) ;
+SIM_VIEW_EVERY=N : une image toutes les N mises à jour (10 par seconde) au lieu de 20.
 """
 import math
 import os
@@ -65,8 +66,9 @@ class TopView:
         if not self.enabled:
             return
         if self.dump:
-            if self.frames % 20 == 0:
-                cv2.imwrite(os.path.join(self.dump, f'{self.title}_{self.frames // 20:03d}.png'), img)
+            every = int(os.environ.get('SIM_VIEW_EVERY', 20))  # 20 = une image toutes les 2 s
+            if self.frames % every == 0:
+                cv2.imwrite(os.path.join(self.dump, f'{self.title}_{self.frames // every:04d}.png'), img)
             self.frames += 1
             self.last = img
             return
