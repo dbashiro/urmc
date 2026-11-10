@@ -237,6 +237,20 @@ class Sim(Node):
         self.create_timer(0.2, self.publish_scan)
         self.scan_pts = []
         self.track = ExitTrack(lay) if '--track' in sys.argv else None
+        shapes = [sim_core.shape_line([(w[0], w[1]), (w[2], w[3])], '#222222', 0.02) for w in lay.walls]
+        shapes += [{'t': 'circle', 'center': [float(cx), float(cy)], 'r': float(rr), 'c': '#6b4a1e', 'fill': '#b98c4a'}
+                   for cx, cy, rr in obstacles]
+        ext = 0.45
+        if self.track is not None:   # piste après la sortie
+            ext = TRACK_LEN + 0.25
+            p0, d = self.track.p0, np.array(self.track.dir)
+            nrm = np.array([-d[1], d[0]]) * 0.11
+            shapes += [sim_core.shape_line([p0 + nrm, p0 + nrm + d * TRACK_LEN], '#c9a800', 0.02),
+                       sim_core.shape_line([p0 - nrm, p0 - nrm + d * TRACK_LEN], '#9aa0a6', 0.02),
+                       sim_core.shape_line([p0 + nrm + d * TRACK_LEN, p0 - nrm + d * TRACK_LEN], '#222222', 0.04)]
+        self.traj = sim_core.TrajLog((-0.5, -ext if lay.exit_wall == 'bottom' else -0.15,
+                                      lay.W + (ext if lay.exit_wall == 'right' else 0.15),
+                                      lay.H + (ext if lay.exit_wall == 'top' else 0.15)), shapes)
         self.on_track = False
         self.idle_since = None
         if self.track is not None:
@@ -263,6 +277,7 @@ class Sim(Node):
         clear = min([dist_segment(self.x, self.y, s) for s in self.lay.walls] +
                     [math.hypot(self.x - cx, self.y - cy) - rr for cx, cy, rr in self.obs]) - ROBOT_R
         self.min_clear = min(self.min_clear, clear)
+        self.traj.add(self.t, self.x, self.y)
         if '--trace' in sys.argv and round(self.t / dt) % 50 == 0:
             print(f't={self.t:4.1f} x={self.x:+.2f} y={self.y:+.2f} yaw={math.degrees(self.yaw):+5.0f} '
                   f'v={self.v:.2f} w={self.w:+.2f}', flush=True)
@@ -339,6 +354,7 @@ class Sim(Node):
         v.show(img)
 
     def end(self, msg):
+        self.traj.end(msg)
         print(msg, flush=True)
         raise SystemExit(0 if msg.startswith('SUCCESS') else 1)
 

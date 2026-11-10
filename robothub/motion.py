@@ -36,10 +36,11 @@ class Step:
 class Drive(Step):
     """Avance (dist > 0) ou recule (dist < 0) en gardant le cap de départ.
     `dist` peut être une fonction (évaluée au démarrage de l'étape).
-    `stop_front` : arrêt anticipé si un obstacle LiDAR est plus proche (marche avant)."""
+    `stop_front` : arrêt anticipé si un obstacle LiDAR est plus proche (marche avant).
+    `heading` : fonction donnant le cap à tenir (relue à chaque cycle) au lieu du cap de départ."""
 
-    def __init__(self, dist, speed=0.10, stop_front=None):
-        self._dist, self.speed, self.stop_front = dist, speed, stop_front
+    def __init__(self, dist, speed=0.10, stop_front=None, heading=None):
+        self._dist, self.speed, self.stop_front, self.heading = dist, speed, stop_front, heading
         self.traveled = 0.0
 
     def start(self, ctx):
@@ -54,7 +55,8 @@ class Drive(Step):
         if self.stop_front is not None and self.dist > 0 and ctx.front_min < self.stop_front:
             return 0.0, 0.0, True
         v = min(self.speed, max(0.025, 1.5 * remaining))
-        return math.copysign(v, self.dist), 2.0 * wrap(self.yaw0 - ctx.yaw), False
+        target = self.heading() if self.heading is not None else self.yaw0
+        return math.copysign(v, self.dist), 2.0 * wrap(target - ctx.yaw), False
 
 
 class Rotate(Step):

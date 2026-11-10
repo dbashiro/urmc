@@ -52,11 +52,32 @@ def render_sign(digit, px):
     return s
 
 
+SUB = 8   # sur-échantillonnage du rendu des panneaux : taille et position au 1/8 de pixel
+
+
+def draw_sign(img, digit, u, v, size):
+    """Dessine le panneau `digit` centré en (u, v) px, de côté `size` px (valeurs non entières :
+    comme une vraie caméra, un panneau un peu plus proche est un peu plus grand, pas « 1 px de plus
+    d'un coup »). Renvoie la boîte entière (x0, y0, x1, y1) touchée, ou None s'il sort de l'image."""
+    x0, y0 = int(math.floor(u - size / 2)), int(math.floor(v - size / 2))
+    x1, y1 = int(math.ceil(u + size / 2)) + 1, int(math.ceil(v + size / 2)) + 1
+    if size < 6 or x0 < 0 or y0 < 0 or x1 > img.shape[1] or y1 > img.shape[0]:
+        return None
+    big = cv2.resize(img[y0:y1, x0:x1], None, fx=SUB, fy=SUB, interpolation=cv2.INTER_NEAREST)
+    n = max(1, int(round(size * SUB)))
+    bx, by = int(round((u - size / 2 - x0) * SUB)), int(round((v - size / 2 - y0) * SUB))
+    big[by:by + n, bx:bx + n] = render_sign(digit, n)[:big.shape[0] - by, :big.shape[1] - bx]
+    img[y0:y1, x0:x1] = cv2.resize(big, (x1 - x0, y1 - y0), interpolation=cv2.INTER_AREA)
+    return x0, y0, x1, y1
+
+
 def make_templates(path):
     os.makedirs(path, exist_ok=True)
     for d in (1, 2, 3):
-        px = int(FOCAL * SIGN_SIZE / (SIGN_Y - 0.0))  # vu depuis l'allée
-        cv2.imwrite(os.path.join(path, f'zone{d}_sim.png'), render_sign(d, px))
+        img = np.full((IMG_H, IMG_W, 3), 30, np.uint8)
+        # vu depuis l'axe de l'allée, comme on capture les modèles sur le vrai terrain
+        x0, y0, x1, y1 = draw_sign(img, d, IMG_W / 2, IMG_H * 0.3, FOCAL * SIGN_SIZE / (SIGN_Y - 0.0))
+        cv2.imwrite(os.path.join(path, f'zone{d}_sim.png'), img[y0:y1, x0:x1])
     print('modèles écrits dans', path)
 
 
@@ -72,6 +93,7 @@ class Sim(Node):
         self.robot = sim_core.Robot(x, y, yaw, level, rng)
         self.cam = sim_core.Camera(level, rng)
         self.x, self.y, self.yaw = x, y, yaw
+        self.start = (x, y, yaw)
         self.v = self.w = 0.0
         self.t = 0.0
         p1 = order.index(1)
@@ -79,6 +101,15 @@ class Sim(Node):
         self.attached = None                     # pose de la palette dans le repère robot
         self.magnet = False
         self.crossed = set()
+        shapes = [sim_core.shape_line([(-0.2, 0.0), (1.25, 0.0)], '#bbbbbb', 0.005, dash=True)]
+        for i, n in enumerate(order):
+            col = {1: '#c98a00', 2: '#1f9d3a'}.get(n, '#888888')
+            shapes.append(sim_core.shape_rect(ZONE_X[i] - ZONE_HALF[0], ZONE_Y - ZONE_HALF[1],
+                                              ZONE_X[i] + ZONE_HALF[0], ZONE_Y + ZONE_HALF[1], col))
+            shapes.append(sim_core.shape_text(ZONE_X[i], SIGN_Y + 0.03, str(n), col))
+        shapes.append(sim_core.shape_rect(ZONE_X[p1] - PALLET_HALF, ZONE_Y - PALLET_HALF, ZONE_X[p1] + PALLET_HALF,
+                                          ZONE_Y + PALLET_HALF, '#6b4a1e', '#d9b98a'))
+        self.traj = sim_core.TrajLog((-0.25, -0.2, 1.3, 0.65), shapes)
         self.create_subscription(Twist, '/cmd_vel', self.on_cmd, 10)
         self.create_subscription(Bool, '/electromagnet', self.on_magnet, 10)
         self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
@@ -97,6 +128,12 @@ class Sim(Node):
         self.robot.command(m.linear.x, m.angular.z)
 
     def on_magnet(self, m):
+        if m.data and not self.magnet:
+            # vérité terrain à la prise : sert à juger l'estimation de position de la mission
+            fx, fy = self.front()
+            print(f't={self.t:.1f} aimant ON : robot vrai ({self.x:.3f}, {self.y:.3f}) cap '
+                  f'{math.degrees(self.yaw):+.1f}° ; avant à {(fy - (self.pallet[1] - PALLET_HALF)) * 100:+.1f} cm '
+                  f'de la face palette, {(fx - self.pallet[0]) * 100:+.1f} cm de son axe', flush=True)
         self.magnet = m.data
         if not m.data and self.attached is not None:
             self.attached = None
@@ -112,6 +149,7 @@ class Sim(Node):
         r = self.robot
         r.step(dt)
         self.x, self.y, self.yaw, self.v, self.w = r.x, r.y, r.yaw, r.v, r.w
+        self.traj.add(self.t, self.x, self.y)
         if '--trace' in sys.argv and round(self.t / dt) % 50 == 0:
             print(f't={self.t:4.1f} x={self.x:+.2f} y={self.y:+.2f} yaw={math.degrees(self.yaw):+5.0f} '
                   f'v={self.v:+.2f} w={self.w:+.2f} aimant={self.magnet}', flush=True)
@@ -119,7 +157,9 @@ class Sim(Node):
         # contact avec la face avant de la palette (y = pallet_y - PALLET_HALF)
         face = self.pallet[1] - PALLET_HALF
         if self.attached is None and fy > face + 0.01 and abs(fx - self.pallet[0]) < PALLET_HALF:
-            self.end(f'COLLISION avec la palette t={self.t:.1f}s')
+            self.end(f'COLLISION avec la palette t={self.t:.1f}s robot vrai ({self.x:.3f}, {self.y:.3f}) '
+                     f'cap {math.degrees(self.yaw):+.1f}° départ ({self.start[0]:.3f}, {self.start[1]:.3f}, '
+                     f'{math.degrees(self.start[2]):+.1f}°)')
         if self.magnet and self.attached is None and abs(fy - face) < 0.02 \
                 and abs(fx - self.pallet[0]) < 0.04:
             c, s = math.cos(-self.yaw), math.sin(-self.yaw)
@@ -176,12 +216,7 @@ class Sim(Node):
             fwd, left = c * dx + s * dy, -s * dx + c * dy
             if fwd < 0.05:
                 continue
-            u = IMG_W / 2 - FOCAL * left / fwd
-            px = int(FOCAL * SIGN_SIZE / fwd)
-            x0, y0 = int(u - px / 2), int(IMG_H * 0.3 - px / 2)
-            if px < 6 or x0 < 0 or y0 < 0 or x0 + px > IMG_W or y0 + px > IMG_H:
-                continue
-            img[y0:y0 + px, x0:x0 + px] = render_sign(n, px)
+            draw_sign(img, n, IMG_W / 2 - FOCAL * left / fwd, IMG_H * 0.3, FOCAL * SIGN_SIZE / fwd)
         return img  # bruit, éclairage, flou : sim_core.Camera
 
     def draw(self):
@@ -209,6 +244,7 @@ class Sim(Node):
         v.show(np.hstack([img, cam]))
 
     def end(self, msg):
+        self.traj.end(msg)
         print(msg, flush=True)
         raise SystemExit(0 if msg.startswith('SUCCESS') else 1)
 
@@ -225,6 +261,8 @@ def main():
     node = Sim(order, level, rng)
     print(f'zones (positions 0, 1, 2) : {order} | niveau={level.name} seed={seed} '
           f'centres x={[round(z, 3) for z in ZONE_X]}', flush=True)
+    print(f'départ vrai ({node.start[0]:.3f}, {node.start[1]:.3f}) cap {math.degrees(node.start[2]):+.1f}° ; '
+          f'roues g={node.robot.scale_l:.4f} d={node.robot.scale_r:.4f}', flush=True)
     try:
         rclpy.spin(node)
     except SystemExit as e:

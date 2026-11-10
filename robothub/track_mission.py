@@ -107,6 +107,9 @@ class TrackMission(Node):
         self.priority_gate = dp('priority_gate', self.mission == 'parcours')
         self.last_diverge_t = -1e9
         self.debug = dp('debug', True)
+        # diagnostic : dossier où enregistrer les images sur lesquelles la piste n'est pas trouvée (150 max), ou vues pendant la traversée d'un carrefour
+        self.dump_lost = dp('dump_lost', '')
+        self.dumped = 0
 
         lane_params = vision.LaneParams()
         turn = self.cross_turn
@@ -205,6 +208,10 @@ class TrackMission(Node):
         self.last_img = now
         self.frame += 1
         lane = self.lane.process(img)
+        if self.dump_lost and (not lane.found or self.state == 'CROSS') and self.state in ('FOLLOW', 'CROSS') \
+                and self.dumped < 150:
+            self.dumped += 1
+            cv2.imwrite(f'{self.dump_lost}/lost_{self.dumped:03d}_{self.state}_d{self.dist * 100:.0f}.png', img)
 
         if self.state == 'DONE':
             self.drive(0.0, 0.0)

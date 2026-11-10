@@ -4,6 +4,7 @@
     python3 test/sim_hub.py --batch [--seeds 5] [--level real,hard] [--only enclos,piste]
                                     [--jobs 6]           campagne en terminal (code retour 0 = tout OK)
     python3 test/sim_hub.py --run piste-aleatoire --seed 3 --level hard [--view]   un seul essai
+    python3 test/sim_hub.py --trajets [DOSSIER]          tous les trajets d'une campagne sur un écran
 
 Depuis le PC (hors Docker) : test/sim_hub.sh [mêmes options].
 
@@ -81,7 +82,7 @@ SCENARIOS = [
              'fake_enclosure_sim.py --layout fixed --track', 'enclos'),
     Scenario('stockage', 'Stockage : palette ① -> ②',
              f'ros2 run robothub storage_mission --ros-args --params-file {CONFIG} '
-             f'-p templates_dir:={TEMPLATES}',
+             f'-p templates_dir:={TEMPLATES} -p sign_dist:=0.55',
              'fake_storage_sim.py', 'stockage'),
 ]
 BY_NAME = {s.name: s for s in SCENARIOS}
@@ -134,6 +135,7 @@ def run_one(scn, seed, level, view=False, out_dir=None, on_line=None, stop_event
     env = dict(os.environ, ROS_DOMAIN_ID=str(domain), ROS_LOCALHOST_ONLY='1', PYTHONUNBUFFERED='1')
     if not view:
         env.pop('SIM_VIEW_DUMP', None)
+    env['SIM_TRAJ'] = str(log_dir / 'traj.jsonl')   # trajectoire vraie, pour la vue d'ensemble (sim_trajets.py)
     sim_cmd = f'python3 {HERE / scn.sim} --seed {seed} --level {level}' + (' --view' if view else '')
     t0 = time.time()
     mission = sim = None
@@ -182,15 +184,36 @@ def run_one(scn, seed, level, view=False, out_dir=None, on_line=None, stop_event
 
 
 def _kill(p):
+    """Arrête tout le groupe de processus de `p`. Ctrl+C d'abord (la mission publie vitesse nulle),
+    puis on s'assure qu'il ne reste personne : dans une commande « A & B & wait », A et B ignorent
+    Ctrl+C et survivaient à bash — une mission fantôme restait sur son ROS_DOMAIN_ID et envoyait
+    des ordres d'arrêt au robot de l'essai suivant qui réutilisait ce domaine."""
+    def alive():
+        try:
+            os.killpg(p.pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError):
+            return False
     if p.poll() is None:
         try:
-            os.killpg(p.pid, signal.SIGINT)   # Ctrl+C : la mission publie vitesse nulle
+            os.killpg(p.pid, signal.SIGINT)
             p.wait(timeout=3)
         except Exception:
-            try:
-                os.killpg(p.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            pass
+    for sig, wait in ((signal.SIGTERM, 1.0), (signal.SIGKILL, 0.5)):
+        if not alive():
+            break
+        try:
+            os.killpg(p.pid, sig)
+        except ProcessLookupError:
+            break
+        t_end = time.time() + wait
+        while alive() and time.time() < t_end:
+            time.sleep(0.05)
+    try:
+        p.wait(timeout=1)
+    except Exception:
+        pass
 
 
 def plan(scenarios, seeds, levels):
@@ -345,6 +368,15 @@ def gui():
     batch_btn.pack(side='left')
     stop_btn = ttk.Button(btns, text='■ Arrêter', state='disabled')
     stop_btn.pack(side='left', padx=6)
+
+    def show_trajets():
+        import sim_trajets
+        w = state.get('trajets')
+        if w is not None and w.winfo_exists():
+            w.lift()
+            return
+        state['trajets'] = sim_trajets.open_window(root, state.get('out'), follow=lambda: state.get('out'))
+    ttk.Button(btns, text='🗺  Voir les trajets', command=show_trajets).pack(side='left', padx=6)
 
     progress = ttk.Progressbar(right, mode='determinate')
     progress.pack(fill='x', pady=(8, 2))
@@ -502,7 +534,12 @@ def main():
     ap.add_argument('--only', default='')
     ap.add_argument('--jobs', type=int, default=max(2, min(8, (os.cpu_count() or 4) // 2)))
     ap.add_argument('--view', action='store_true')
+    ap.add_argument('--trajets', nargs='?', const='', metavar='DOSSIER',
+                    help='vue d\'ensemble des trajets d\'une campagne (défaut : la dernière)')
     a = ap.parse_args()
+    if a.trajets is not None:
+        import sim_trajets
+        return sim_trajets.main(a.trajets or None)
     if a.batch:
         sys.exit(batch_cli(a))
     if a.run:

@@ -25,6 +25,10 @@ track_mission:
       white_hi: [148, 72, 255]
       lane_width_frac: 0.6
       center_offset: 0.0
+      # Luminosité (V) médiane du sol dans la zone utile le jour où les seuils ci-dessus ont été réglés.
+      # Si la salle est plus sombre / plus claire, l'image est ramenée à ce niveau avant d'appliquer
+      # les seuils (bandes + damier). 0.0 = apprise au départ ; -1.0 = pas de correction.
+      floor_v_ref: 107.0
     barrier:                    # couleur de la barrière (planche bleu foncé sur la vraie piste)
       lo: [90, 120, 20]
       hi: [130, 255, 170]
@@ -41,6 +45,13 @@ enclosure_mission:
     entrance_goal_deg: 0.0      # direction de l'entrée par rapport au cap de départ (+ = gauche)
     exit_extra: 0.20
     detect_entrance_sign: false
+    use_planner: true           # dans l'enclos : carte des murs + chemin calculé (false = ancien pilotage réactif)
+    lookahead_dist: 0.22        # m : point visé sur le chemin
+    door_min_width: 0.25        # largeur d'un trou du contour accepté comme porte
+    door_max_width: 0.75
+    entry_exclusion: 0.45       # une porte à moins de ça de l'entrée = l'entrée, pas la sortie
+    exit_goal_dist: 0.30        # but visé derrière la porte de sortie
+    exit_pass: 0.10             # m au-delà de la ligne de porte = sorti
 
 storage_mission:
   ros__parameters:
@@ -54,3 +65,11 @@ storage_mission:
     leave_dist: 0.25            # m au-delà de la dernière zone pour sortir de la zone de stockage
     sign_x_range: [0.25, 0.75]  # bande centrale de l'image où lire le panneau
     sign_min_score: 0.60
+    sign_settle: 0.6            # s d'attente après une rotation avant de lire un panneau (retard caméra)
+    aim_sign: true              # viser le panneau à chaque zone : recale le cap, la dérive des roues et l'axe de la zone
+    camera_hfov_deg: 62.0       # champ horizontal de la caméra (approximatif : la visée se corrige en plusieurs fois)
+    # Distance caméra -> panneau (m) à l'endroit où les modèles zone1/2/3 ont été capturés (robot dans
+    # l'axe de l'allée, face au panneau). > 0.0 : la taille apparente du panneau corrige un départ mal
+    # placé en profondeur avant d'aller à la palette. 0.0 = désactivé. À MESURER sur le vrai terrain.
+    sign_dist: 0.0
+    depth_fix_max: 0.06         # m : au-delà, la mesure par la taille du panneau est ignorée

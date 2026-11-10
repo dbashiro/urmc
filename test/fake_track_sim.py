@@ -311,6 +311,7 @@ class Sim(Node):
             self.sign = (ex + 0.12, ey + 0.10, 0.10)   # à droite de la piste, après la fin
         else:
             self.sign = None
+        self.traj = sim_core.TrajLog(*self.traj_scene())
         self.create_subscription(Twist, '/cmd_vel', self.on_cmd, 10)
         self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
         self.img_pub = self.create_publisher(CompressedImage, '/camera/image_raw/compressed',
@@ -335,6 +336,48 @@ class Sim(Node):
     def on_cmd(self, m):
         self.robot.command(m.linear.x, m.angular.z)
 
+    def traj_scene(self):
+        """Terrain pour la vue d'ensemble des trajets : cadre + bandes, damier, barrière, robot 2."""
+        L, R = sim_core.shape_line, sim_core.shape_rect
+        yel, whi = '#c9a800', '#9aa0a6'
+        shapes = []
+        if self.kind in ('cross', 'parcours'):
+            cx, cy = CROSS_C
+            hl, rc, n = CROSS_HL, CROSS_RC, 1.3
+            for a, b, col in (((0.2, cy + hl), (cx - hl - rc, cy + hl), yel), ((0.2, cy - hl), (cx - hl - rc, cy - hl), whi),
+                              ((cx - hl, cy + hl + rc), (cx - hl, cy + n), yel), ((cx + hl, cy + hl + rc), (cx + hl, cy + n), whi),
+                              ((cx + hl + rc, cy + hl), (cx + n, cy + hl), whi), ((cx + hl + rc, cy - hl), (cx + n, cy - hl), yel),
+                              ((cx - hl, cy - n), (cx - hl, cy - hl - rc), yel), ((cx + hl, cy - n), (cx + hl, cy - hl - rc), whi)):
+                shapes.append(L([a, b], col, LINE_W))
+            for c0, t0, col in (((cx - hl - rc, cy + hl + rc), -90, yel), ((cx + hl + rc, cy + hl + rc), 180, whi),
+                                ((cx + hl + rc, cy - hl - rc), 90, whi), ((cx - hl - rc, cy - hl - rc), 0, yel)):
+                ts = np.radians(np.linspace(t0, t0 + 90, 8))
+                shapes.append(L([(c0[0] + rc * math.cos(t), c0[1] + rc * math.sin(t)) for t in ts], col, LINE_W))
+            if self.kind == 'parcours':
+                tail = self.pts[self.pts[:, 0] >= cx + 1.25]
+                shapes.append(L(offset(tail, TRACK_W / 2 + LINE_W / 2), whi, LINE_W, step=5))
+                shapes.append(L(offset(tail, -TRACK_W / 2 - LINE_W / 2), yel, LINE_W, step=5))
+        else:
+            shapes.append(L(offset(self.pts, TRACK_W / 2 + LINE_W / 2), yel, LINE_W, step=5))
+            shapes.append(L(offset(self.pts, -TRACK_W / 2 - LINE_W / 2), whi, LINE_W, step=5))
+        ex, ey, eyaw = self.end
+        c, s = math.cos(eyaw), math.sin(eyaw)
+        if self.kind in ('straight', 'random'):   # damier d'arrivée
+            h = TRACK_W / 2
+            shapes.append({'t': 'poly', 'c': '#222222', 'fill': '#555555',
+                           'pts': [[ex + s * h, ey - c * h], [ex - s * h, ey + c * h],
+                                   [ex - s * h + c * 0.05, ey + c * h + s * 0.05], [ex + s * h + c * 0.05, ey - c * h + s * 0.05]]})
+        if self.sign is not None:
+            shapes.append({'t': 'circle', 'center': [self.sign[0], self.sign[1]], 'r': 0.04, 'c': '#b00000', 'fill': '#e03030'})
+        if self.barrier_x is not None:
+            shapes.append(L([(self.barrier_x, 1.0 - 0.16), (self.barrier_x, 1.0 + 0.16)], '#1b2a7a', 0.03))
+        if self.other is not None:
+            shapes.append(L([tuple(self.other), (self.other[0], self.other_end)], '#7a3db8', 0.01, dash=True))
+            shapes.append(sim_core.shape_text(self.other[0], self.other[1] - 0.08, 'robot 2', '#7a3db8'))
+        xs = [q[0] for sh in shapes if sh['t'] == 'line' for q in sh['pts']] + [ex]
+        ys = [q[1] for sh in shapes if sh['t'] == 'line' for q in sh['pts']] + [ey]
+        return (min(xs) - 0.2, min(ys) - 0.2, max(xs) + 0.2, max(ys) + 0.2), shapes
+
     def deviation(self):
         d = np.hypot(self.pts[:, 0] - self.x, self.pts[:, 1] - self.y)
         i = int(np.argmin(d))
@@ -352,6 +395,7 @@ class Sim(Node):
         self.update_other(dt)
         dev, i = self.deviation()
         self.max_dev = max(self.max_dev, dev)
+        self.traj.add(self.t, self.x, self.y)
         if '--trace' in sys.argv and round(self.t / dt) % 50 == 0:
             print(f't={self.t:4.1f} x={self.x:+.2f} y={self.y:+.2f} yaw={math.degrees(self.yaw):+5.0f} '
                   f'v={self.v:.2f} w={self.w:+.2f} écart={dev * 100:.1f} cm', flush=True)
@@ -544,6 +588,7 @@ class Sim(Node):
         self.scan_pub.publish(m)
 
     def end_run(self, msg):
+        self.traj.end(msg)
         print(msg, flush=True)
         raise SystemExit(0 if msg.startswith('SUCCESS') else 1)
 

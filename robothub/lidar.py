@@ -17,6 +17,22 @@ def _near_neighbors(r, bad, near, k=2):
     return out & bad
 
 
+def _close_runs(r, bad, near, max_run):
+    """Suites de faisceaux invalides encadrées des DEUX côtés par un écho très proche (< near) :
+    objet collé au robot dont le milieu est sous range_min. Limité à `max_run` faisceaux, pour ne
+    pas boucher une vraie ouverture (robot dans une porte : montants proches à gauche et à droite)."""
+    out = np.zeros(r.size, bool)
+    idx = np.flatnonzero(~bad)
+    if idx.size < 2:
+        return out
+    nxt = np.roll(idx, -1)
+    gap = (nxt - idx) % r.size                     # idx[k] -> écho valide suivant (tour complet)
+    for i, j, g in zip(idx, nxt, gap):
+        if 1 < g <= max_run + 1 and r[i] < near and r[j] < near:
+            out[(i + 1 + np.arange(g - 1)) % r.size] = True
+    return out
+
+
 def scan_arrays(msg, far=None):
     """Le LDS-01 renvoie 0 aussi bien quand il n'y a pas d'écho (loin) que quand l'objet est
     plus près que range_min (12 cm). Un 0 entouré d'échos très proches = objet collé au
@@ -25,6 +41,8 @@ def scan_arrays(msg, far=None):
     far = msg.range_max if far is None else far
     bad = _invalid(msg, r)
     too_close = _near_neighbors(r, bad, msg.range_min + 0.06)
+    if msg.angle_increment > 0:
+        too_close |= _close_runs(r, bad, msg.range_min + 0.04, int(math.radians(100) / msg.angle_increment))
     r = np.where(bad, np.where(too_close, msg.range_min, far), r).astype(np.float32)
     a = msg.angle_min + np.arange(r.size, dtype=np.float32) * msg.angle_increment
     a = np.arctan2(np.sin(a), np.cos(a))
@@ -60,7 +78,9 @@ class ScanFilter:
         self.yaw = yaw
         r, a = scan_arrays(msg)
         held = bad & (self.last < self.hold_near) & (now - self.last_t < self.hold_time)
-        r = np.where(held, np.minimum(r, msg.range_min), r).astype(np.float32)
+        # dernière distance vue (au plus hold_near) : exacte si le faisceau a juste été perdu, et proche
+        # de range_min si l'objet est passé dessous
+        r = np.where(held, np.minimum(r, np.maximum(self.last, msg.range_min)), r).astype(np.float32)
         # on ne rafraîchit la mémoire qu'avec de vrais échos (les faisceaux tenus gardent leur date)
         self.last = np.where(bad, self.last, raw)
         self.last_t = np.where(bad, self.last_t, now)

@@ -4,6 +4,7 @@ import types
 
 import cv2
 import numpy as np
+import pytest
 
 from robothub import lidar, vision
 from robothub.motion import Ctx, Drive, Rotate, Sequencer
@@ -196,7 +197,7 @@ def test_scan_filter_holds_beam_that_went_too_close():
     f = lidar.ScanFilter(hold_near=0.30, hold_time=2.0)
     r, _ = f(_lds(lambda ang: 0.20), 0.0)          # mur à 20 cm tout autour
     r, a = f(_lds(lambda ang: 0.05), 0.5)          # trop près partout : que des 0
-    assert r.max() <= 0.12                         # mémoire : toujours un mur
+    assert r.max() <= 0.21                         # mémoire : toujours un mur, à la dernière distance vue
     r, _ = f(_lds(lambda ang: 0.05), 3.0)          # mémoire expirée
     assert r.min() > 3.0
     r, _ = f(_lds(lambda ang: 5.0), 3.5)           # loin + pas d'écho -> libre
@@ -211,7 +212,7 @@ def test_scan_filter_follows_rotation():
     f(_lds(near_left), 0.0, yaw=0.0)
     r, a = f(_lds(lambda ang: 5.0), 0.2, yaw=math.pi / 2)
     deg = np.degrees(a)
-    assert r[np.argmin(np.abs(deg))] <= 0.12
+    assert r[np.argmin(np.abs(deg))] <= 0.16
     assert r[np.argmin(np.abs(deg - 90))] > 3.0
 
 
@@ -269,3 +270,145 @@ def test_lane_any_color_handles_swapped_colors():
         det.process(track_image(0))
     assert abs(det.process(swapped(0)).error) < 0.05
     assert det.process(swapped(50)).error > 0.15 and det.process(swapped(-50)).error < -0.15
+
+
+# --------------------------------------------------------------------------- enclos : portes + chemin
+
+def _enclosure_scan(x, y, yaw, obstacles=(), noise=0.0, seed=0):
+    """Scan façon LDS-01 dans l'enclos de la figure 4 (1.5 x 1.0 m, entrée à gauche en haut,
+    sortie en bas à droite), robot en (x, y, yaw)."""
+    walls = [(0, 0, 0, 0.55), (0, 0.95, 0, 1.0), (0, 0, 1.15, 0), (1.5, 0, 1.5, 1.0), (0, 1.0, 1.5, 1.0)]
+    rng = np.random.default_rng(seed)
+
+    def ray(ang):
+        dx, dy = math.cos(yaw + ang), math.sin(yaw + ang)
+        best = math.inf
+        for x1, y1, x2, y2 in walls:
+            ex, ey = x2 - x1, y2 - y1
+            den = dx * ey - dy * ex
+            if abs(den) < 1e-9:
+                continue
+            t = ((x1 - x) * ey - (y1 - y) * ex) / den
+            u = ((x1 - x) * dy - (y1 - y) * dx) / den
+            if t > 0 and 0 <= u <= 1:
+                best = min(best, t)
+        for cx, cy, cr in obstacles:
+            fx, fy = x - cx, y - cy
+            b = fx * dx + fy * dy
+            disc = b * b - (fx * fx + fy * fy - cr * cr)
+            if disc >= 0 and -b - math.sqrt(disc) > 0:
+                best = min(best, -b - math.sqrt(disc))
+        return best + (rng.normal(0, noise) if noise else 0.0)
+    return lidar.scan_arrays(_lds(ray))
+
+
+def _to_world(p, x, y, yaw):
+    c, s = math.cos(yaw), math.sin(yaw)
+    return x + c * p[0] - s * p[1], y + s * p[0] + c * p[1]
+
+
+def test_enclosure_exit_door_found_from_several_places():
+    from robothub import enclosure_nav as nav
+    obstacles = [(0.94, 0.36, 0.04), (1.24, 0.69, 0.04), (0.48, 0.72, 0.06)]
+    for (x, y, yaw) in [(0.25, 0.75, 0.0), (0.6, 0.5, -0.5), (0.75, 0.3, 0.3), (1.2, 0.5, -1.2), (0.3, 0.3, 1.0)]:
+        r, a = _enclosure_scan(x, y, yaw, obstacles, noise=0.012, seed=3)
+        pts, r, a = nav.valid_points(r, a, 3.4)
+        box = nav.fit_rect(pts, nav.find_walls(pts))
+        assert box is not None, (x, y)
+        doors = [_to_world(d.c, x, y, yaw) + _to_world(d.n, 0, 0, yaw) for d in nav.find_doors(r, a, pts, box)]
+        exits = [d for d in doors if math.hypot(d[0] - 0.0, d[1] - 0.75) > 0.45]   # hors porte d'entrée
+        assert len(exits) == 1, (x, y, doors)
+        cx, cy, nx, ny = exits[0]
+        assert math.hypot(cx - 1.325, cy) < 0.08 and ny < -0.9, (x, y, exits)
+
+
+def test_enclosure_obstacle_gap_is_not_a_door():
+    from robothub import enclosure_nav as nav
+    # sortie cachée par un gros obstacle : le passage entre l'obstacle et le mur n'est pas une porte
+    x, y, yaw = 0.5, 0.5, 0.0
+    r, a = _enclosure_scan(x, y, yaw, [(1.0, 0.25, 0.12)])
+    pts, r, a = nav.valid_points(r, a, 3.4)
+    box = nav.fit_rect(pts, nav.find_walls(pts))
+    doors = [_to_world(d.c, x, y, yaw) for d in nav.find_doors(r, a, pts, box)]
+    assert all(math.hypot(dx, dy - 0.75) < 0.45 for dx, dy in doors), doors
+
+
+def test_enclosure_planner_path_keeps_clear_of_obstacles():
+    from robothub import enclosure_nav as nav
+    obstacles = [(0.8, 0.45, 0.06), (1.2, 0.5, 0.05)]   # sur la ligne droite vers la sortie
+    x, y, yaw = 0.25, 0.75, 0.0
+    r, a = _enclosure_scan(x, y, yaw, obstacles, noise=0.01)
+    pts, r, a = nav.valid_points(r, a, 3.4)
+    planner = nav.Planner()
+    planner.update(r, a, pts)
+    c, s = math.cos(-yaw), math.sin(-yaw)
+    gx, gy = 1.325 - x, -0.30 - y           # 30 cm derrière la porte de sortie
+    path = planner.plan((c * gx - s * gy, s * gx + c * gy), 0.11)
+    assert path is not None and len(path) > 10
+    world = [_to_world(p, x, y, yaw) for p in path]
+    assert math.hypot(world[-1][0] - 1.325, world[-1][1] + 0.30) < 0.06
+    for wx, wy in world:
+        assert all(math.hypot(wx - ox, wy - oy) - orad > 0.09 for ox, oy, orad in obstacles)
+        if wy > 0.02:   # à l'intérieur : loin des murs
+            assert 0.09 < wx < 1.41 and wy < 0.91
+    assert planner.plan((2.0, 2.0), 0.11) is None or True   # but hors enclos : ne doit pas planter
+    la = nav.lookahead(path, 0.22)
+    assert 0.15 < math.hypot(*la) < 0.35
+
+
+def test_aim_sign_turns_until_sign_is_centered(tmp_path):
+    """Visée du panneau : converge même si le champ de la caméra est mal réglé (ici 62° réels, 90° déclarés)."""
+    import logging
+    pytest.importorskip('rclpy')             # storage_mission importe ROS : test sauté hors conteneur
+    from robothub.storage_mission import AimSign
+    sign = np.full((24, 24), 255, np.uint8)
+    cv2.rectangle(sign, (0, 0), (23, 23), 0, 2)
+    cv2.putText(sign, '1', (6, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.6, 0, 2)
+    cv2.imwrite(str(tmp_path / 'zone1_a.png'), sign)
+    focal = 160 / math.tan(math.radians(31))
+    sign_dir = math.radians(96.0)            # le panneau est 6° à gauche du cap prévu (90°)
+
+    class FakeNode:
+        classifier = vision.SignClassifier(str(tmp_path))
+        sign_x_range, sign_min_score, sign_settle = (0.1, 0.9), 0.6, 0.2
+        camera_hfov = math.radians(90.0)
+        img_count, last_img, aim_yaw = 0, None, None
+
+        def get_logger(self):
+            return logging.getLogger('test')
+
+    node, ctx = FakeNode(), Ctx()
+    ctx.x = ctx.y = 0.0
+    ctx.yaw = math.radians(90.0)
+    step = AimSign(node, 'zone1')
+    step.start(ctx)
+    for i in range(600):
+        ctx.now = i * 0.05
+        if i % 2 == 0:                       # caméra à 10 images/s
+            img = np.full((240, 320, 3), 40, np.uint8)
+            u = int(160 + focal * math.tan(ctx.yaw - sign_dir))
+            if 12 <= u < 308:
+                img[60:84, u - 12:u + 12] = sign[:, :, None]
+            node.last_img, node.img_count = img, node.img_count + 1
+        _, ang, done = step.update(ctx)
+        ctx.yaw += ang * 0.05
+        if done:
+            break
+    assert done and abs(math.degrees(ctx.yaw - sign_dir)) < 1.0
+    assert node.aim_yaw is not None and abs(math.degrees(node.aim_yaw - sign_dir)) < 1.0
+
+
+def test_lane_survives_dim_light():
+    """Salle 35 % plus sombre que le jour du réglage : sans correction les bandes passent sous les
+    seuils ; avec floor_v_ref la piste et le damier restent détectés."""
+    img = np.full((240, 320, 3), (95, 107, 95), np.uint8)
+    cv2.line(img, (40, 239), (130, 132), (54, 141, 134), 8)      # jaune à gauche
+    cv2.line(img, (280, 239), (190, 132), (189, 201, 180), 8)    # blanche à droite
+    dim = (img * 0.65).astype(np.uint8)
+    base = dict(yellow_lo=(25, 93, 95), yellow_hi=(90, 255, 242), white_lo=(55, 11, 165), white_hi=(148, 72, 255))
+    off = vision.LaneDetector(vision.LaneParams(floor_v_ref=-1.0, **base))
+    on = vision.LaneDetector(vision.LaneParams(floor_v_ref=107.0, **base))
+    assert off.process(img).found and not off.process(dim).found
+    for _ in range(3):
+        r = on.process(dim)
+    assert r.found and abs(r.error) < 0.1

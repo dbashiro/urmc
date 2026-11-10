@@ -88,6 +88,13 @@ class LaneParams:
     jump_frac: float = 0.07        # saut max d'une bande entre deux lignes analysées (fraction de largeur)
     side_frac: float = 0.60        # une bande jaune « nouvelle » doit être à gauche de 60 % de la largeur
                                    # (la blanche à droite de 40 %) : la jaune de notre route est à gauche
+    # Éclairage : les seuils ci-dessus ont été réglés un jour donné. Si la salle est plus sombre ou
+    # plus claire, la luminosité de l'image est ramenée à celle du réglage avant d'appliquer les
+    # seuils (bandes et damier). floor_v_ref = luminosité (V) médiane du sol dans la zone utile le
+    # jour du réglage ; 0 = apprise sur les premières images où la piste est bien vue ; < 0 = désactivé.
+    floor_v_ref: float = 0.0
+    gain_min: float = 0.6
+    gain_max: float = 1.8
     # damier d'arrivée
     checker_band: float = 0.35     # partie basse de la ROI où l'on cherche le damier
     checker_v_max: int = 80        # « noir » = V < checker_v_max
@@ -120,6 +127,9 @@ class LaneDetector:
         self.debug = debug
         self.lane_w = None
         self.prev_y = self.prev_w = None   # bandes au bas de l'image précédente : (ligne, x)
+        self.floor_ref = self.p.floor_v_ref if self.p.floor_v_ref > 0 else None
+        self.ref_n = 0
+        self.gain = 1.0
 
     def process(self, bgr):
         p = self.p
@@ -127,6 +137,12 @@ class LaneDetector:
         h, w = img.shape[:2]
         y0 = int(h * p.roi_top)
         hsv = cv2.cvtColor(img[y0:], cv2.COLOR_BGR2HSV)
+        floor_v = float(np.median(hsv[::4, ::4, 2]))   # le sol occupe l'essentiel de la zone utile
+        if p.floor_v_ref >= 0 and self.floor_ref is not None and floor_v > 1:
+            g = min(p.gain_max, max(p.gain_min, self.floor_ref / floor_v))
+            self.gain = 0.5 * self.gain + 0.5 * g
+            if abs(self.gain - 1.0) > 0.03:
+                hsv[:, :, 2] = cv2.convertScaleAbs(hsv[:, :, 2], alpha=self.gain)
         k = np.ones((3, 3), np.uint8)
         ym = cv2.morphologyEx(hsv_mask(hsv, p.yellow_lo, p.yellow_hi), cv2.MORPH_OPEN, k)
         wm = cv2.morphologyEx(hsv_mask(hsv, p.white_lo, p.white_hi), cv2.MORPH_OPEN, k)
@@ -209,6 +225,12 @@ class LaneDetector:
 
         self.prev_y, self.prev_w = first_y, first_w
         res.found = len(centers) >= 3
+        if (p.floor_v_ref == 0 and self.ref_n < 10 and res.yellow_rows >= 8 and res.white_rows >= 8):
+            # apprentissage au départ : moyenne du sol sur 10 images où les deux bandes sont bien vues
+            self.ref_n += 1
+            self._ref_sum = getattr(self, '_ref_sum', 0.0) + floor_v
+            if self.ref_n == 10:
+                self.floor_ref = self._ref_sum / 10
         if res.points:
             res.reach = 1.0 - (min(pt[0] for pt in res.points) - y0) / max(nrows, 1)
         if res.found:
@@ -372,6 +394,54 @@ class SignClassifier:
             return None, 0.0, None
         label = max(per_label, key=lambda k: per_label[k][0])
         return (label,) + per_label[label]
+
+    def measure(self, bgr, label, x_range=(0.0, 1.0), span=0.16, step=0.02, up=4):
+        """Position et taille apparente précises du panneau `label` : -> (score, x_centre en fraction
+        de la largeur, taille relative au modèle) ou None. La taille relative (1.0 = comme sur le
+        modèle, 1.1 = 10 % plus gros donc ~10 % plus près) est cherchée par pas de 2 % autour de la
+        meilleure échelle grossière, sur une imagette agrandie `up` fois, puis affinée par parabole."""
+        gray = cv2.cvtColor(resize_to_width(bgr, self.work_width), cv2.COLOR_BGR2GRAY)
+        gx0 = int(x_range[0] * gray.shape[1])
+        band = gray[:, gx0:int(x_range[1] * gray.shape[1])]
+        best = None
+        for lab, t in self.templates:
+            if lab != label:
+                continue
+            for s in self.scales:
+                tw, th = int(t.shape[1] * s), int(t.shape[0] * s)
+                if tw < 12 or th < 12 or tw >= band.shape[1] or th >= band.shape[0]:
+                    continue
+                r = cv2.matchTemplate(band, cv2.resize(t, (tw, th)), cv2.TM_CCOEFF_NORMED)
+                _, v, _, loc = cv2.minMaxLoc(r)
+                if best is None or v > best[0]:
+                    best = (float(v), loc[0] + gx0, loc[1], tw, th, t)
+        if best is None:
+            return None
+        v0, x, y, tw, th, t = best
+        m = int(0.3 * max(tw, th)) + 2
+        x0, y0 = max(0, x - m), max(0, y - m)
+        roi = gray[y0:y + th + m, x0:x + tw + m]
+        roi = cv2.resize(roi, None, fx=up, fy=up, interpolation=cv2.INTER_CUBIC)
+        pts = []
+        f = tw / t.shape[1] * (1.0 - span)
+        while f <= tw / t.shape[1] * (1.0 + span) + 1e-9:
+            w, h = int(round(t.shape[1] * f * up)), int(round(t.shape[0] * f * up))
+            f += step
+            if w < 12 or h < 12 or w > roi.shape[1] or h > roi.shape[0]:
+                continue
+            r = cv2.matchTemplate(roi, cv2.resize(t, (w, h), interpolation=cv2.INTER_CUBIC), cv2.TM_CCOEFF_NORMED)
+            _, v, _, loc = cv2.minMaxLoc(r)
+            pts.append((w / (t.shape[1] * up), float(v), loc[0] + 0.5 * w))
+        if not pts:
+            return None
+        i = max(range(len(pts)), key=lambda k: pts[k][1])
+        scale, v, cx = pts[i]
+        if 0 < i < len(pts) - 1:
+            (sa, va, _), (sb, vb, _) = pts[i - 1], pts[i + 1]
+            den = va - 2.0 * v + vb
+            if den < -1e-9:
+                scale += 0.5 * (va - vb) / den * 0.5 * (sb - sa)
+        return v, (x0 + cx / up) / gray.shape[1], scale
 
     def scores(self, bgr, only=None, x_range=(0.0, 1.0)):
         """-> {label: (meilleur score, boîte)} pour chaque étiquette."""

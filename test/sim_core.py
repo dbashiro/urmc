@@ -16,7 +16,9 @@ Ce qui est modélisé :
 Tout est tiré d'un générateur seedé : un même (scénario, seed, niveau) se rejoue à l'identique
 côté simulateur.
 """
+import json
 import math
+import os
 from collections import deque
 from dataclasses import dataclass
 
@@ -193,3 +195,58 @@ def jpeg(img, quality=80):
     m.format = 'jpeg'
     m.data = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, quality])[1].tobytes()
     return m
+
+
+class TrajLog:
+    """Trajectoire vraie du robot, pour la vue d'ensemble (test/sim_trajets.py). Actif seulement si
+    la variable d'environnement SIM_TRAJ donne un fichier (le centre de simulation la règle) :
+    1re ligne = terrain (cadre + formes à dessiner), puis [t, x, y] tous les `period` s, puis le verdict."""
+
+    def __init__(self, bounds, shapes, period=0.1):
+        self.f = None
+        self.period, self.next_t, self.last = period, 0.0, None
+        path = os.environ.get('SIM_TRAJ')
+        if not path:
+            return
+        try:
+            self.f = open(path, 'w')
+            self._write({'meta': {'bounds': [round(float(v), 3) for v in bounds], 'shapes': shapes}})
+        except OSError:
+            self.f = None
+
+    def _write(self, obj):
+        self.f.write(json.dumps(obj, separators=(',', ':')) + '\n')
+        self.f.flush()
+
+    def add(self, t, x, y):
+        if self.f is None or t < self.next_t:
+            return
+        self.next_t = t + self.period
+        if self.last is not None and abs(x - self.last[0]) < 0.003 and abs(y - self.last[1]) < 0.003:
+            return   # à l'arrêt : rien de nouveau
+        self.last = (x, y)
+        self._write([round(t, 1), round(x, 3), round(y, 3)])
+
+    def end(self, msg):
+        if self.f is None:
+            return
+        self._write({'end': msg})
+        self.f.close()
+        self.f = None
+
+
+def shape_line(pts, color='#444444', width=0.01, dash=False, step=1):
+    pts = [[round(float(x), 3), round(float(y), 3)] for x, y in list(pts)[::step]]
+    return {'t': 'line', 'pts': pts, 'c': color, 'w': width, 'dash': dash}
+
+
+def shape_rect(x0, y0, x1, y1, color='#444444', fill=''):
+    return {'t': 'poly', 'pts': [[x0, y0], [x1, y0], [x1, y1], [x0, y1]], 'c': color, 'fill': fill}
+
+
+def shape_circle(x, y, r, color='#444444', fill=''):
+    return {'t': 'circle', 'center': [x, y], 'r': r, 'c': color, 'fill': fill}
+
+
+def shape_text(x, y, s, color='#444444'):
+    return {'t': 'text', 'p': [x, y], 's': s, 'c': color}

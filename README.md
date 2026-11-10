@@ -99,6 +99,11 @@ carré), il avance au cap de la route (odométrie) jusqu'à retrouver les bandes
 2. **`checker_overrun`** (0.13 m) : distance parcourue après que la caméra voit le damier,
    pour que le robot s'arrête *dessus*. Dépend de l'inclinaison de la caméra.
 3. **`stop_sign_area`** : plus grand = s'arrête plus près du panneau STOP.
+   **`lane.floor_v_ref`** : luminosité (V) médiane du sol le jour où les seuils de couleur ont été
+   réglés (107 le 05/11). Le suivi ramène chaque image à ce niveau avant d'appliquer les seuils,
+   pour tenir si la salle est plus sombre ou plus claire. Si on refait les seuils, la remesurer
+   (ou mettre 0.0 : apprise sur les premières images au départ ; -1.0 : pas de correction).
+   `dump_lost:=/tmp/perdu` enregistre les images où la piste n'est pas trouvée (diagnostic).
 4. **`barrier_cam_bottom`** : le LiDAR (~17 cm de haut) ne voit pas une barrière basse,
    c'est la caméra qui compte. Plus grand = s'arrête plus près.
 5. **Panneaux de zone** (épreuve 5) : capturer les vrais panneaux ①②③ depuis l'allée,
@@ -106,6 +111,11 @@ carré), il avance au cap de la route (odométrie) jusqu'à retrouver les bandes
    (puis `zone2`, `zone3`). Idem `label:=tunnel` si on tente le point du panneau d'entrée.
 6. **Géométrie de la zone de stockage** : `zones_side`, `first_zone_dist`, `zone_spacing`,
    `approach_dist` (distance allée → plaque métallique), `leave_dist`.
+   **`sign_dist`** : distance caméra → panneau quand le robot est dans l'axe de l'allée, face à une
+   zone (là où on capture les modèles). Une fois réglée, le robot mesure la taille du panneau dans
+   l'image à chaque zone et corrige un départ trop près / trop loin des zones avant d'aller à la
+   palette. Les modèles doivent alors être capturés robot bien dans l'axe. À 0.0 la correction est
+   coupée. `aim_sign: false` coupe toute la visée des panneaux (retour à l'odométrie seule).
 7. **Électroaimant** : câblage sur le GPIO18 du Pi (`gpio_pin`), tester
    `ros2 topic pub --once /electromagnet std_msgs/msg/Bool "{data: true}"`.
 8. **Enclos** : `entrance_goal_deg` = direction de l'entrée par rapport au cap de départ.
@@ -129,12 +139,23 @@ test/sim_hub.sh --run enclos-aleatoire --seed 4 --level hard --view   # rejouer 
 - **Droite, une campagne** : scénarios × seeds × niveaux, en parallèle, avec un tableau
   vert/rouge. Double-clic sur une ligne pour la rejouer avec la vue, clic droit pour ses logs.
 - Résultats et logs dans `test/results/<date>/` (`results.csv`).
+- **Voir les trajets** (bouton à côté de « Lancer la campagne », ou `test/sim_hub.sh --trajets
+  [dossier]`) : toutes les simulations d'une campagne sur un seul écran, en direct. Une vignette par
+  terrain avec les trajets superposés (vert = réussi, rouge + croix = échec, bleu = en cours,
+  pointillés = niveau hard) ; une vignette par seed quand le terrain est tiré au hasard. Survoler un
+  trajet donne le seed, le niveau et le verdict ; cliquer le met en surbrillance. Filtres : scénario,
+  réussis / échecs, niveau, « terrains avec échec seulement ».
 - Chaque essai a son propre `ROS_DOMAIN_ID` (60-99) + `ROS_LOCALHOST_ONLY=1` : aucun risque
   de piloter le vrai robot, même allumé.
 
 Scénarios : `piste-droite`, `piste-virage`, `piste-aleatoire` (tracés en S tirés au hasard),
 `barriere`, `intersection`, `enclos-fixe` (figure 4), `enclos-aleatoire` (taille, entrée,
 sortie en bas/droite/haut ; on vérifie qu'un chemin existe), `stockage`.
+
+État au 10/11, campagne complète de 260 essais (10 seeds, real + hard) : 258/260. Piste, barrière,
+intersection, carrefour, parcours : 180/180. Stockage 20/20, enclos-puis-piste 20/20, enclos-fixe
+19/20, enclos-aleatoire 19/20. Point faible connu : l'enclos en hard (timeouts ; sur certains
+tracés le robot ressort par l'entrée, ex. enclos-fixe seed 2).
 
 **Niveaux de réalisme** (`test/sim_core.py`) :
 
