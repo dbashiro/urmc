@@ -5,16 +5,19 @@
 
 Piste de 20 cm (figure 2) sur moquette noire : jaune à gauche, blanc à droite.
   straight : 1.5 m tout droit puis damier transversal
-  curve    : 1.0 m droit, virage à gauche (R = 0.6 m), 0.6 m droit, panneau rouge à la fin
+  curve    : 1.0 m droit, virage à gauche (R = 0.6 m), 0.6 m droit, panneau STOP sur le côté de la
+             piste (--sign left|right|center), puis encore 0.6 m jusqu'au damier. Panneau sur le
+             côté : il faut marquer l'arrêt ~3 s devant, repartir et s'arrêter sur le damier.
+             Panneau au milieu (center) : arrêt définitif devant.
   random   : tracé tiré au hasard (--seed) : virages à gauche et à droite (R 0.45-0.8 m,
-             virages en S), puis damier — à lancer avec mission:=straight
+             virages en S), puis damier
   cross    : carrefour de la figure 3 du règlement : on arrive par la gauche (robot 1), la jaune
              tourne à gauche, la blanche à droite, et en face les couleurs sont inversées.
              --expect straight (défaut, ce qui est demandé) | left | right : direction attendue.
              Avec --robot-right, le robot 2 arrive du bas et traverse vers le haut : priorité
   parcours : les 4 épreuves enchaînées : ligne droite avec barrière (levée 5 s après l'arrêt),
              carrefour de la figure 3 à traverser tout droit (robot 2 à droite), route d'en face
-             (couleurs inversées) puis virage à gauche et panneau STOP — mission:=parcours
+             (couleurs inversées) puis virage à gauche, panneau STOP sur le côté (arrêt 3 s) et damier
   --level  : réalisme du robot et des capteurs (voir sim_core.py), « real » par défaut
   --barrier : barrière à 0.9 m comme la vraie (planche bleu foncé, 6-12 cm de haut, invisible
              au LiDAR qui est à ~17 cm), levée 5 s après l'arrêt du robot devant elle
@@ -158,17 +161,18 @@ def on_cross_road(x, y, margin):
 
 
 PARCOURS_BARRIER_X = 0.9
+SIGN_BACK = 0.6      # m de piste entre le panneau STOP (curve, parcours) et le damier final
 
 
 def parcours_centerline():
     """Ouest -> est à travers le carrefour, jusqu'au bout de la route d'en face, virage à gauche
-    (R 0.6 m) puis 0.5 m tout droit vers le nord."""
+    (R 0.6 m) puis 0.5 m tout droit vers le nord (panneau STOP) et SIGN_BACK m jusqu'au damier."""
     cx, cy = CROSS_C
     x1, R = cx + 1.3, 0.6
     pts = [(x, cy) for x in np.arange(0.3, x1, 0.01)]
     pts += [(x1 + R * math.sin(t), cy + R * (1 - math.cos(t))) for t in np.arange(0, math.pi / 2, 0.01 / R)]
-    pts += [(x1 + R, cy + R + s) for s in np.arange(0, 0.5, 0.01)]
-    return np.array(pts), (x1 + R, cy + R + 0.5, math.pi / 2)
+    pts += [(x1 + R, cy + R + s) for s in np.arange(0, 0.5 + SIGN_BACK, 0.01)]
+    return np.array(pts), (x1 + R, cy + R + 0.5 + SIGN_BACK, math.pi / 2)
 
 
 def centerline(kind, seed=0):
@@ -189,9 +193,9 @@ def centerline(kind, seed=0):
         for a in np.arange(0, math.pi / 2, 0.01 / R):
             pts.append((x + R * math.sin(a), y + R * (1 - math.cos(a))))
         x, y, yaw = x + R, y + R, math.pi / 2
-        for s in np.arange(0, 0.6, 0.01):
+        for s in np.arange(0, 0.6 + SIGN_BACK, 0.01):
             pts.append((x, y + s))
-        y += 0.6
+        y += 0.6 + SIGN_BACK
     pts.append((x, y))
     return np.array(pts), (x, y, yaw)
 
@@ -232,6 +236,7 @@ def _build_map(kind, seed=0):
             lw = max(1, int(round(LINE_W / RES)))
             cv2.polylines(m, [poly(offset(tail, TRACK_W / 2 + LINE_W / 2))], False, WHITE, lw)
             cv2.polylines(m, [poly(offset(tail, -TRACK_W / 2 - LINE_W / 2))], False, YELLOW, lw)
+            draw_checker(m, end)
         return m, pts, end
     poly = lambda p: np.array([to_px(q) for q in p], np.int32)  # noqa: E731
     half = TRACK_W / 2 + LINE_W
@@ -241,18 +246,22 @@ def _build_map(kind, seed=0):
     cv2.polylines(m, [poly(offset(pts, -TRACK_W / 2 - LINE_W / 2))], False, WHITE, lw)
     # cercle blanc de départ
     cv2.circle(m, to_px(pts[0] + (0.0, 0.0)), int(0.03 / RES), WHITE, 2)
-    if kind != 'curve':  # damier : 2 rangées de cases de 2.5 cm sur la largeur, dans l'axe de la fin
-        x0, y0, yaw = end
-        sq = 0.025
-        c, s = math.cos(yaw), math.sin(yaw)
-        for i in range(2):
-            for j in range(int(TRACK_W / sq)):
-                quad = [(x0 + c * u - s * v, y0 + s * u + c * v)
-                        for u, v in ((i * sq, -TRACK_W / 2 + j * sq), ((i + 1) * sq, -TRACK_W / 2 + j * sq),
-                                     ((i + 1) * sq, -TRACK_W / 2 + (j + 1) * sq), (i * sq, -TRACK_W / 2 + (j + 1) * sq))]
-                cv2.fillPoly(m, [np.array([to_px(q) for q in quad], np.int32)],
-                             WHITE if (i + j) % 2 == 0 else (5, 5, 5))
+    draw_checker(m, end)
     return m, pts, end
+
+
+def draw_checker(m, end):
+    """Damier : 2 rangées de cases de 2.5 cm sur la largeur, dans l'axe de la fin."""
+    x0, y0, yaw = end
+    sq = 0.025
+    c, s = math.cos(yaw), math.sin(yaw)
+    for i in range(2):
+        for j in range(int(TRACK_W / sq)):
+            quad = [(x0 + c * u - s * v, y0 + s * u + c * v)
+                    for u, v in ((i * sq, -TRACK_W / 2 + j * sq), ((i + 1) * sq, -TRACK_W / 2 + j * sq),
+                                 ((i + 1) * sq, -TRACK_W / 2 + (j + 1) * sq), (i * sq, -TRACK_W / 2 + (j + 1) * sq))]
+            cv2.fillPoly(m, [np.array([to_px(q) for q in quad], np.int32)],
+                         WHITE if (i + j) % 2 == 0 else (5, 5, 5))
 
 
 def ground_rays():
@@ -307,10 +316,20 @@ class Sim(Node):
         self.stopped_for_other = False
         self.barrier_stopped = None
         if kind in ('curve', 'parcours'):
-            ex, ey, _ = self.end
-            self.sign = (ex + 0.12, ey + 0.10, 0.10)   # à droite de la piste, après la fin
+            # carton de 7 cm posé au sol sur le côté de la piste (juste derrière la bande), SIGN_BACK - 10 cm
+            # avant le damier. --sign left|right|center : côté (droite par défaut ; center = au milieu)
+            ex, ey, eyaw = self.end
+            side = sys.argv[sys.argv.index('--sign') + 1] if '--sign' in sys.argv else 'right'
+            lat = {'left': 1.0, 'right': -1.0, 'center': 0.0}[side] * (TRACK_W / 2 + LINE_W + 0.05)
+            back = SIGN_BACK - 0.10
+            self.sign = (ex - back * math.cos(eyaw) - lat * math.sin(eyaw),
+                         ey - back * math.sin(eyaw) + lat * math.cos(eyaw), 0.035)
+            self.sign_side = side != 'center'
         else:
             self.sign = None
+            self.sign_side = False
+        self.sign_pause = 0.0        # plus long arrêt marqué devant le panneau (s)
+        self.pause_t0 = None
         self.traj = sim_core.TrajLog(*self.traj_scene())
         self.create_subscription(Twist, '/cmd_vel', self.on_cmd, 10)
         self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
@@ -362,7 +381,7 @@ class Sim(Node):
             shapes.append(L(offset(self.pts, -TRACK_W / 2 - LINE_W / 2), whi, LINE_W, step=5))
         ex, ey, eyaw = self.end
         c, s = math.cos(eyaw), math.sin(eyaw)
-        if self.kind in ('straight', 'random'):   # damier d'arrivée
+        if self.kind != 'cross':   # damier d'arrivée
             h = TRACK_W / 2
             shapes.append({'t': 'poly', 'c': '#222222', 'fill': '#555555',
                            'pts': [[ex + s * h, ey - c * h], [ex - s * h, ey + c * h],
@@ -470,20 +489,36 @@ class Sim(Node):
             self.idle_since = None
             return
         self.idle_since = self.idle_since or self.t
-        if self.t - self.idle_since < 2.0:
-            return
         ex, ey, eyaw = self.end
         # position de l'avant du robot le long de la piste, par rapport à la fin
         fx, fy = self.x + 0.09 * math.cos(self.yaw), self.y + 0.09 * math.sin(self.yaw)
         along = (fx - ex) * math.cos(eyaw) + (fy - ey) * math.sin(eyaw)
+        lateral = abs(-(fx - ex) * math.sin(eyaw) + (fy - ey) * math.cos(eyaw))
+        # devant le panneau (qui est à SIGN_BACK - 10 cm du damier), sans le dépasser
+        at_sign = (self.sign is not None and lateral < 0.3
+                   and -0.55 <= along + SIGN_BACK - 0.10 <= -0.05)
+        if at_sign and self.sign_side:       # arrêt marqué : on attend de voir s'il repart
+            self.sign_pause = max(self.sign_pause, self.t - self.idle_since)
+            if self.t - self.idle_since > 6.0:
+                self.end_run(f'ECHEC t={self.t - self.t_move:.1f}s n\'est pas reparti du panneau STOP '
+                             f'(arrêt à {(along + SIGN_BACK - 0.10) * 100:+.1f} cm du panneau)')
+            return
+        if self.t - self.idle_since < 2.0:
+            return
+        tail = f'de la fin de piste, écart max {self.max_dev * 100:.1f} cm'
         if self.other is not None and not self.stopped_for_other:
             ok = False                       # n'a pas laissé passer le robot prioritaire
-        elif self.kind not in ('curve', 'parcours'):
-            ok = -0.02 <= along <= 0.12      # avant du robot sur / juste après le damier
+        elif self.sign is not None and not self.sign_side:
+            ok = at_sign                     # panneau au milieu : arrêt définitif devant
+            tail = f'du panneau STOP (au milieu), écart max {self.max_dev * 100:.1f} cm'
+            along += SIGN_BACK - 0.10
         else:
-            ok = -0.45 <= along <= 0.05      # arrêté devant le panneau, sans le dépasser
+            ok = -0.02 <= along <= 0.12      # avant du robot sur / juste après le damier
+            if self.sign is not None:        # et arrêt d'environ 3 s marqué devant le panneau
+                ok = ok and 2.7 <= self.sign_pause <= 4.5
+                tail += f', arrêt de {self.sign_pause:.1f} s au panneau STOP'
         self.end_run(f'{"SUCCESS" if ok else "ECHEC"} t={self.idle_since - self.t_move:.1f}s arrêt à {along * 100:+.1f} cm '
-                     f'de la fin de piste, écart max {self.max_dev * 100:.1f} cm')
+                     + tail)
 
     def publish_image(self):
         self.cam.push(self.t, self.cam.effects(self.render(), self.t, self.w))
@@ -532,16 +567,24 @@ class Sim(Node):
         poly([(y0, 0.06), (y1, 0.06), (y1, 0.12), (y0, 0.12)])
 
     def draw_sign(self, img):
-        p = self.project(*self.sign)
-        if p is None or p[2] < 0.05:
+        """Comme le vrai : carton clair de 7 cm debout au sol, disque rouge sombre de 5 cm, barre claire.
+        Couleurs mesurées sur l'image réelle du 12/11 (le rouge est bien plus sombre qu'un rouge pur)."""
+        sx, sy, sz = self.sign
+        eyaw = self.end[2]
+        lx, ly = -math.sin(eyaw), math.cos(eyaw)   # le carton fait face à la piste
+        q = [self.project(sx + lx * a, sy + ly * a, sz + b)
+             for a, b in ((-0.035, -0.035), (0.035, -0.035), (0.035, 0.035), (-0.035, 0.035))]
+        p = self.project(sx, sy, sz)
+        if p is None or p[2] < 0.05 or any(c is None for c in q):
             return
+        cv2.fillPoly(img, [np.array([(c[0], c[1]) for c in q], np.int32)], (108, 120, 104))
         u, v, zc = p
         r = FOCAL * 0.025 / zc
         if r < 1:
             return
-        cv2.circle(img, (int(u), int(v)), int(r), (30, 30, 210), -1)
+        cv2.circle(img, (int(u), int(v)), int(r), (22, 24, 104), -1)
         cv2.rectangle(img, (int(u - 0.7 * r), int(v - 0.18 * r)), (int(u + 0.7 * r), int(v + 0.18 * r)),
-                      (235, 235, 235), -1)
+                      (100, 118, 112), -1)
 
     def on_debug(self, m):
         self.debug_img = cv2.imdecode(np.frombuffer(m.data, np.uint8), cv2.IMREAD_COLOR)

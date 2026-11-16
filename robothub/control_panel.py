@@ -3,8 +3,9 @@
     ros2 run robothub control_panel            (dans le Docker, même ROS_DOMAIN_ID que le robot)
     puis http://localhost:8080                 (~/robot.sh panel fait les deux)
 
-- Vidéo : caméra, image de debug de la mission, ou masque de couleur (réglage HSV en direct),
-  recompressée (largeur / qualité / images par seconde réglables).
+- Vidéo : source « Auto » (debug pendant une mission, caméra sinon), caméra, debug, ou masque de
+  couleur ; double vue, plein écran (STOP et flèches actifs), gel, repères, alerte image figée,
+  clic dans l'image = couleur HSV du point (dans un masque : ajoute cette couleur au masque).
 - Missions : une à la fois, lancée avec les réglages du formulaire (préremplis depuis
   config/robothub.yaml), logs en direct, STOP (bouton ou barre d'espace) = Ctrl+C de la
   mission + vitesse nulle publiée.
@@ -51,7 +52,7 @@ TRACK_PARAMS = [
     ('lane.lookahead', 'Regard au loin (lookahead)', 0.0, 1.0, 0.05),
     ('lane.roi_top', 'Haut de la zone utile (roi_top)', 0.2, 0.9, 0.05),
 ]
-MISSION_DEFAULTS = {'enclosure_follow': {'exit_extra': 0.05}, 'parcours': {'checker_count': 0}}  # valeurs propres à une mission
+MISSION_DEFAULTS = {'enclosure_follow': {'exit_extra': 0.05}}  # valeurs propres à une mission
 INT_PARAMS = {'checker_count'}  # déclarés en entier dans les nœuds : ROS refuse 1.0 pour un entier
 
 
@@ -62,37 +63,25 @@ def _typed(spec, v):
 CODE_DEFAULTS = {'checker_count': 1, 'slow_k': 0.6, 'lane.lookahead': 0.35, 'speed': 0.10, 'cross_straight': 0.70,
                  'cross_speed': 0.08}
 MISSIONS = {
-    'follow': dict(label='Suivi de ligne seul (réglages)', exe='track_mission', node='track_mission',
-                   params=TRACK_PARAMS),
-    'straight': dict(label='Ligne droite + arrêt damier', exe='track_mission', node='track_mission',
-                     params=TRACK_PARAMS + [('checker_overrun', 'Avance après damier (m)', 0.0, 0.4, 0.01)]),
-    'curve': dict(label='Virage + arrêt panneau STOP', exe='track_mission', node='track_mission',
-                  params=TRACK_PARAMS + [('stop_sign_area', 'Taille panneau pour s\'arrêter', 0.002, 0.06, 0.001)]),
-    'barrier': dict(label='Barrière', exe='track_mission', node='track_mission',
-                    params=TRACK_PARAMS + [('barrier_cam_bottom', 'Barrière : s\'arrêter à (bas image 0-1)', 0.1, 1.0, 0.05)]),
-    'intersection': dict(label='Intersection, priorité à droite', exe='track_mission', node='track_mission',
-                         params=TRACK_PARAMS + [('priority_range', 'Distance de détection robot (m)', 0.2, 1.5, 0.05),
-                                                ('cross_straight', 'Carrefour : traversée max tout droit (m)', 0.3, 1.2, 0.05),
-                                                ('cross_speed', 'Carrefour : vitesse (m/s)', 0.03, 0.15, 0.01)]),
-    'parcours': dict(label='Parcours complet : barrière + carrefour + virage + STOP', exe='track_mission',
-                     node='track_mission',
-                     params=TRACK_PARAMS + [
-                         ('barrier_cam_bottom', 'Barrière : s\'arrêter à (bas image 0-1)', 0.1, 1.0, 0.05),
-                         ('priority_range', 'Carrefour : distance détection robot (m)', 0.2, 1.5, 0.05),
-                         ('cross_straight', 'Carrefour : traversée max tout droit (m)', 0.3, 1.2, 0.05),
-                         ('stop_sign_area', 'Panneau STOP : taille pour s\'arrêter', 0.002, 0.06, 0.001),
-                         ('checker_count', 'S\'arrêter au damier n° (0 = jamais)', 0, 5, 1)]),
-    'enclosure': dict(label='Enclos (LiDAR seul — couper la caméra !)', exe='enclosure_mission',
-                      node='enclosure_mission',
-                      params=[('speed', 'Vitesse (m/s)', 0.03, 0.22, 0.01),
-                              ('robot_radius', 'Marge aux murs (m)', 0.09, 0.2, 0.005),
-                              ('entrance_goal_deg', 'Direction de l\'entrée (°)', -90.0, 90.0, 5.0)]),
+    'piste': dict(label='1 · Piste : suivi de ligne, virage, barrière, intersection, damier, STOP', exe='track_mission',
+                  node='track_mission',
+                  params=TRACK_PARAMS + [
+                      ('stop_sign_area', 'Panneau STOP : taille pour s\'arrêter', 0.002, 0.06, 0.001),
+                      ('stop_sign_edge', 'Panneau STOP : s\'arrêter aussi s\'il sort de l\'image (marge, 0 = non)', 0.0, 0.3, 0.01),
+                      ('checker_count', 'S\'arrêter au damier n° (0 = jamais)', 0, 5, 1),
+                      ('checker_overrun', 'Damier : avance après l\'avoir vu (m)', 0.0, 0.4, 0.01),
+                      ('barrier_cam_bottom', 'Barrière : s\'arrêter à (bas image 0-1)', 0.1, 1.0, 0.05),
+                      ('priority_range', 'Intersection : distance détection robot (m)', 0.2, 1.5, 0.05),
+                      ('cross_straight', 'Intersection : traversée max tout droit (m)', 0.3, 1.2, 0.05),
+                      ('cross_speed', 'Intersection : vitesse de traversée (m/s)', 0.03, 0.15, 0.01)]),
     'enclosure_follow': dict(
-        label='Enclos (LiDAR) puis suivi de ligne', exe='enclosure_mission', node='enclosure_mission',
+        label='2 · Enclos (LiDAR) puis suivi de ligne', exe='enclosure_mission', node='enclosure_mission',
         # le suivi de ligne attend la sortie de l'enclos pour ouvrir la caméra
         extra=['-p', 'handoff:=true'],   # + exit_extra court : le suivi de ligne prend la main tout de suite
         also=[dict(exe='track_mission', node='track_mission',
-                   extra=['-p', 'mission:=straight', '-p', 'start_topic:=/robothub/enclosure_done',
+                   # après l'enclos : suivi jusqu'au damier, sans barrière / intersection / panneau
+                   extra=['-p', 'barrier:=false', '-p', 'priority:=false', '-p', 'stop_on_stop_sign:=false',
+                          '-p', 'start_topic:=/robothub/enclosure_done',
                           '-p', 'start_delay:=0.3'])],
         params=[('speed', 'Enclos : vitesse (m/s)', 0.03, 0.22, 0.01),
                 ('robot_radius', 'Enclos : marge aux murs (m)', 0.09, 0.2, 0.005),
@@ -100,7 +89,7 @@ MISSIONS = {
                 ('max_speed', 'Piste : vitesse max (m/s)', 0.02, 0.22, 0.01, 'track_mission'),
                 ('kp', 'Piste : kp', 0.0, 5.0, 0.1, 'track_mission'),
                 ('kd', 'Piste : kd', 0.0, 5.0, 0.1, 'track_mission')]),
-    'storage': dict(label='Stockage palette (électroaimant)', exe='storage_mission', node='storage_mission',
+    'storage': dict(label='3 · Épreuve 5 : stockage palette (électroaimant)', exe='storage_mission', node='storage_mission',
                     params=[('speed', 'Vitesse (m/s)', 0.03, 0.22, 0.01),
                             ('approach_dist', 'Approche palette (m)', 0.05, 0.4, 0.01),
                             ('first_zone_dist', '1re zone (m)', 0.0, 1.0, 0.01),
@@ -245,6 +234,7 @@ class Panel(Node):
                 'barrier.lo': BarrierParams.lo, 'barrier.hi': BarrierParams.hi}
         for preset, (klo, khi) in HSV_KEYS.items():
             self.hsv[preset] = [list(p.get(klo, dflt[klo])), list(p.get(khi, dflt[khi]))]
+        self.roi_top = float(p.get('lane.roi_top', 0.55))
 
     # --------------------------------------------------- missions
     def add_log(self, line):
@@ -263,8 +253,6 @@ class Panel(Node):
         self.extra_procs = []
         for i, c in enumerate(cmds):
             args = ['ros2', 'run', 'robothub', c['exe'], '--ros-args', '--params-file', self.config]
-            if c['exe'] == 'track_mission' and not any('mission:=' in x for x in c['extra']):
-                args += ['-p', f'mission:={name}']
             args += c['extra']
             for p in m['params']:  # chaque réglage va au nœud qui le concerne
                 if p[0] in params and (p[5] if len(p) > 5 else m['node']) == c['node']:
@@ -365,12 +353,37 @@ class Panel(Node):
         color = {'yellow': (0, 255, 255), 'white': (255, 0, 255), 'red': (0, 0, 255), 'barrier': (0, 255, 0)}[preset]
         out = (img * 0.45).astype(np.uint8)
         out[m > 0] = color
-        roi = read_params(self.config, 'track_mission').get('lane.roi_top', 0.55)
-        y = int(out.shape[0] * roi)
+        y = int(out.shape[0] * self.roi_top)
         cv2.line(out, (0, y), (out.shape[1], y), (0, 140, 255), 1)  # orange (BGR)
         cv2.putText(out, f'{100 * np.count_nonzero(m[y:]) / max(1, m[y:].size):.1f}% detecte sous la ligne',
                     (5, out.shape[0] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         return cv2.imencode('.jpg', out, [cv2.IMWRITE_JPEG_QUALITY, q])[1].tobytes()
+
+    def auto_source(self):
+        """Source « Auto » : l'image de debug tant qu'une mission en publie, sinon la caméra."""
+        dbg = self.sources['debug']
+        return dbg if dbg.t is not None and time.time() - dbg.t < 1.0 else self.sources['camera']
+
+    def source(self, key):
+        return self.auto_source() if key == 'auto' else self.sources.get(key, self.sources['camera'])
+
+    def pixel(self, x, y):
+        """Couleur (médiane d'un carré 7x7) du point (x, y) en 0-1 de la dernière image caméra."""
+        jpeg = self.sources['camera'].jpeg
+        img = None if jpeg is None else cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError('pas d\'image caméra')
+        h, w = img.shape[:2]
+        cx, cy = min(w - 1, max(0, int(x * w))), min(h - 1, max(0, int(y * h)))
+        patch = img[max(0, cy - 3):cy + 4, max(0, cx - 3):cx + 4]
+        hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(int)
+        hue = hsv[:, 0]
+        if hue.max() - hue.min() > 90:   # rouge à cheval sur 0/180 : médiane sur le cercle
+            hue = (int(np.median((hue + 90) % 180)) - 90) % 180
+        else:
+            hue = int(np.median(hue))
+        b, g, r = (int(v) for v in np.median(patch.reshape(-1, 3), axis=0))
+        return {'hsv': [hue, int(np.median(hsv[:, 1])), int(np.median(hsv[:, 2]))], 'rgb': [r, g, b]}
 
     def state(self, since):
         now = time.time()
@@ -384,7 +397,7 @@ class Panel(Node):
             'robot': {'odom_age': age('odom'), 'scan_age': age('scan'), 'battery': self.battery,
                       'battery_age': age('battery'), 'v': round(self.speed[0], 3), 'w': round(self.speed[1], 2)},
             'video': {k: s.stats() for k, s in self.sources.items()},
-            'teleop': self.teleop_active,
+            'teleop': self.teleop_active, 'roi_top': self.roi_top,
         }
 
     def missions_info(self):
@@ -433,9 +446,13 @@ def make_handler(node):
                 node.reload_hsv()
                 return self.json(node.hsv)
             if u.path == '/snapshot.jpg':
-                src = node.sources.get(q.get('src', 'camera'), node.sources['camera'])
-                jpeg = src.encoded(0, 95)
+                jpeg = node.source(q.get('src', 'camera')).encoded(0, 95)
                 return self.send(200, 'image/jpeg', jpeg) if jpeg else self.send(404, 'text/plain', b'pas d image')
+            if u.path == '/api/pixel':
+                try:
+                    return self.json(node.pixel(float(q['x']), float(q['y'])))
+                except (KeyError, ValueError) as e:
+                    return self.json({'error': str(e)}, 400)
             if u.path == '/stream.mjpg':
                 num = lambda k, lo, hi, d: max(lo, min(hi, int(q[k]))) if q.get(k, '').isdigit() else d  # noqa: E731
                 return self.stream(q.get('src', 'camera'), num('w', 80, 1280, 320), num('q', 10, 95, 50),
@@ -468,6 +485,7 @@ def make_handler(node):
                     for p in m['params']:
                         if p[0] in b['params']:
                             write_param(node.config, p[5] if len(p) > 5 else m['node'], p[0], _typed(p, b['params'][p[0]]))
+                    node.reload_hsv()   # roi_top a pu changer
                     node.add_log(f'✔ réglages {b["mission"]} enregistrés dans le YAML')
                 else:
                     return self.json({'error': 'introuvable'}, 404)
@@ -481,11 +499,14 @@ def make_handler(node):
             self.send_header('Cache-Control', 'no-store')
             self.end_headers()
             mask = key.startswith('mask-')
-            src = node.sources['camera'] if mask else node.sources.get(key, node.sources['camera'])
+            src = None
             last, period = -1, 1.0 / fps
             try:
                 while rclpy.ok():
                     t0 = time.time()
+                    cur = node.sources['camera'] if mask else node.source(key)
+                    if cur is not src:   # « auto » change de source en cours de route
+                        src, last = cur, -1
                     with src.cond:
                         if src.seq == last:
                             src.cond.wait(timeout=1.0)
@@ -508,80 +529,157 @@ PAGE = r"""<!doctype html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>RobotHub Panneau</title>
 <style>
-:root{--bg:#0f1115;--panel:#181b21;--line:#2a2f38;--fg:#e6e8eb;--dim:#8b93a1;--acc:#3d8bfd;--ok:#3ecf6e;--warn:#f0b429;--bad:#ef4444}
+:root{--bg:#0d0f13;--panel:#171a20;--panel2:#20242d;--line:#2b303a;--fg:#e8eaed;--dim:#8d95a3;--acc:#4c8dff;--ok:#3ecf6e;--warn:#f0b429;--bad:#ef4444}
 *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,sans-serif}
-header{display:flex;flex-wrap:wrap;align-items:center;gap:14px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
-h1{font-size:16px;margin:0} .pill{display:inline-flex;align-items:center;gap:6px;color:var(--dim);font-size:13px}
+header{position:sticky;top:0;z-index:20;display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;padding:8px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
+h1{font-size:16px;margin:0 6px 0 0} .pill{display:inline-flex;align-items:center;gap:6px;color:var(--dim);font-size:13px;font-variant-numeric:tabular-nums}
 .dot{width:9px;height:9px;border-radius:50%;background:var(--bad)} .dot.ok{background:var(--ok)} .dot.warn{background:var(--warn)}
-main{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(320px,1fr);gap:14px;padding:14px}
-@media(max-width:900px){main{grid-template-columns:1fr}}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px}
-.card h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 10px}
-.tabs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
-.tabs button{background:#232731;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 10px;cursor:pointer}
-.tabs button.on{background:var(--acc);border-color:var(--acc)}
-#video{width:100%;aspect-ratio:4/3;object-fit:contain;background:#000;border-radius:8px;display:block}
+#hstop{margin-left:auto;background:var(--bad);padding:6px 14px}
+#banner{background:#5a1d1d;color:#ffd9d9;padding:7px 16px;font-weight:600}
+main{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(330px,1fr);gap:14px;padding:14px;align-items:start}
+@media(min-width:901px){.left{position:sticky;top:56px}}
+@media(max-width:900px){main{grid-template-columns:1fr;padding:8px;gap:8px}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px}
+.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:var(--dim);margin:0 0 10px;display:flex;align-items:center;gap:8px}
+.card h2 .sp{flex:1}
+.stack>*+*{margin-top:14px}
+.tabs{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-bottom:8px}
+.tabs button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:7px;padding:6px 10px;cursor:pointer;font-size:13px}
+.tabs button.on{background:var(--acc);border-color:var(--acc);color:#fff}
+.tabs .sep{color:var(--dim);font-size:12px;margin-left:8px}
+kbd{font:10px ui-monospace,monospace;color:var(--dim);border:1px solid var(--line);border-radius:4px;padding:0 4px;margin-left:6px}
+.on kbd{color:#dbe7ff;border-color:#8bb3ff}
+/* ---- vidéo */
+#stage{position:relative;display:grid;grid-template-columns:1fr;gap:4px;background:#000;border-radius:10px;overflow:hidden}
+#stage.dual{grid-template-columns:1fr 1fr}
+.view{position:relative;aspect-ratio:4/3;max-height:calc(100vh - 215px);background:#000;min-width:0}
+.view img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;display:block;transition:opacity .2s}
+.view.stale img{opacity:.35}
+#stage:fullscreen{width:100vw;height:100vh;border-radius:0}
+#stage:fullscreen .view{aspect-ratio:auto;height:100vh;max-height:none}
+#frame{position:absolute;pointer-events:none}
+#frame.pick{pointer-events:auto;cursor:crosshair}
+#frame .vl,#frame .hl{position:absolute;display:none}
+#frame.grid .vl{display:block;left:50%;top:0;bottom:0;border-left:1px dashed rgba(255,255,255,.75)}
+#frame.grid .hl{display:block;left:0;right:0;border-top:1px dashed #ff9d2e}
+#frame .hl span{position:absolute;right:4px;top:2px;font-size:11px;color:#ff9d2e;text-shadow:0 0 3px #000}
+#mark{position:absolute;width:14px;height:14px;margin:-7px 0 0 -7px;border:2px solid #fff;border-radius:50%;box-shadow:0 0 0 1px #000;pointer-events:none}
+.hud{position:absolute;display:flex;gap:6px;align-items:center;z-index:3;pointer-events:none}
+.hud.tl{left:8px;top:8px} .hud.bl{left:8px;right:8px;bottom:8px}
+.chip{background:rgba(0,0,0,.66);color:#fff;border-radius:6px;padding:3px 8px;font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.chip.ok{color:#8ff0b0} .chip.warn{color:#ffd166} .chip.bad{background:var(--bad);font-weight:700}
+#hudLine{overflow:hidden;text-overflow:ellipsis;max-width:100%}
+.tools{position:absolute;right:8px;top:8px;display:flex;gap:4px;z-index:4}
+.tools button{width:34px;height:30px;border:0;border-radius:6px;background:rgba(0,0,0,.66);color:#fff;font-size:15px;cursor:pointer}
+.tools button:hover{background:rgba(60,60,60,.9)} .tools button.on{background:var(--acc)}
+#empty{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;color:var(--dim);text-align:center;padding:20px}
+#empty b{font-size:18px;color:var(--fg)}
+#src2{position:absolute;left:8px;top:8px;z-index:3}
+#fsStop{display:none;position:absolute;right:14px;bottom:44px;z-index:5;background:var(--bad);font-size:20px;padding:14px 26px}
+#stage:fullscreen #fsStop{display:block}
+[hidden]{display:none!important}
 .row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:8px;color:var(--dim)}
-select,input[type=number]{background:#232731;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 6px}
+#swatch{display:inline-block;width:14px;height:14px;border-radius:3px;border:1px solid #fff;vertical-align:-2px;margin-right:6px}
+details>summary{cursor:pointer;color:var(--dim);font-size:13px;user-select:none}
+details[open]>summary{margin-bottom:6px}
+select,input[type=number]{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 6px}
 input[type=range]{width:100%;accent-color:var(--acc)}
 .btn{border:0;border-radius:8px;padding:9px 14px;font-weight:600;cursor:pointer;color:#fff;background:var(--acc)}
-.btn:disabled{opacity:.4;cursor:not-allowed} .btn.go{background:var(--ok);color:#06210f} .btn.ghost{background:#232731;border:1px solid var(--line)}
+.btn:disabled{opacity:.4;cursor:not-allowed} .btn.go{background:var(--ok);color:#06210f;flex:1;font-size:16px;padding:12px}
+.btn.ghost{background:var(--panel2);border:1px solid var(--line)} .btn.sm{padding:4px 9px;font-size:12px;font-weight:500}
 #stop{width:100%;background:var(--bad);font-size:20px;padding:16px;margin-top:10px;letter-spacing:.05em}
-.params{display:grid;grid-template-columns:1fr 120px 70px;gap:4px 10px;align-items:center;margin:8px 0}
+/* ---- missions */
+.mlist{display:grid;gap:6px;margin-bottom:10px}
+.mlist button{text-align:left;background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:9px;padding:9px 12px;cursor:pointer}
+.mlist button b{display:block;font-size:15px} .mlist button small{color:var(--dim)}
+.mlist button.on{border-color:var(--acc);box-shadow:inset 0 0 0 1px var(--acc);background:#1c2740}
+.mlist button:disabled{cursor:not-allowed;opacity:.55} .mlist button.on:disabled{opacity:1}
+.params{display:grid;grid-template-columns:1fr 110px 70px;gap:4px 10px;align-items:center;margin:8px 0}
 .params label{color:var(--dim);font-size:13px} .params input[type=number]{width:70px}
-#log{height:230px;overflow:auto;background:#0b0d10;border:1px solid var(--line);border-radius:8px;padding:8px;font:12px/1.45 ui-monospace,monospace;white-space:pre-wrap;margin:0}
+#log{height:260px;overflow:auto;background:#090b0e;border:1px solid var(--line);border-radius:8px;padding:8px;font:12px/1.45 ui-monospace,monospace;white-space:pre-wrap;margin:0}
 #log .err{color:#ff8a8a} #log .ok{color:#7ee2a0} #log .cmd{color:#8ab4ff}
 .hsv{display:grid;grid-template-columns:52px 1fr 40px;gap:2px 8px;align-items:center;font-size:13px;color:var(--dim)}
 .hsv span.v{color:var(--fg);text-align:right;font-variant-numeric:tabular-nums}
-.pad{display:grid;grid-template-columns:repeat(3,52px);gap:6px;justify-content:center;margin-top:6px}
-.pad button{height:44px;font-size:18px;border-radius:8px;border:1px solid var(--line);background:#232731;color:var(--fg);cursor:pointer;touch-action:none}
+.pad{display:grid;grid-template-columns:repeat(3,56px);gap:6px;justify-content:center;margin-top:6px}
+.pad button{height:46px;font-size:18px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--fg);cursor:pointer;touch-action:none}
 .pad button:active,.pad button.on{background:var(--acc)}
-.hint{color:var(--dim);font-size:12px}
-.status{font-weight:600} .stack>*+*{margin-top:14px}
+.hint{color:var(--dim);font-size:12px} .status{font-weight:600}
 </style></head><body>
 <header>
- <h1>RobotHub — panneau</h1>
+ <h1>RobotHub</h1>
  <span class="pill"><span id="d-odom" class="dot"></span>robot</span>
  <span class="pill"><span id="d-scan" class="dot"></span>LiDAR</span>
  <span class="pill"><span id="d-cam" class="dot"></span>caméra <span id="camfps"></span></span>
  <span class="pill"><span id="d-bat" class="dot"></span>batterie <span id="bat">?</span></span>
  <span class="pill" id="speed"></span>
+ <span class="pill status" id="hmission"></span>
+ <button class="btn" id="hstop">■ STOP</button>
 </header>
+<div id="banner" hidden></div>
 <main>
- <div class="stack">
+ <div class="stack left">
   <section class="card">
    <div class="tabs" id="srcTabs"></div>
-   <img id="video" alt="en attente d'image…">
+   <div id="stage">
+    <div class="view" id="view0">
+     <img id="video" alt="">
+     <div id="frame"><div class="vl"></div><div class="hl" id="roiLine"><span>haut de la zone utile</span></div><div id="mark" hidden></div></div>
+     <div id="empty" hidden><b id="emptyT"></b><span id="emptyS"></span></div>
+     <div class="hud tl"><span class="chip" id="live">…</span><span class="chip" id="srcName"></span></div>
+    </div>
+    <div class="view" id="view1" hidden>
+     <img id="video2" alt="">
+     <select id="src2" title="Source de la 2e vue"></select>
+    </div>
+    <div class="tools">
+     <button id="bGrid" title="Repères : axe de l'image + haut de la zone utile (G)">✛</button>
+     <button id="bPause" title="Geler / reprendre l'image (V)">⏸</button>
+     <button id="bSnap" title="Photo en pleine résolution (P)">📷</button>
+     <button id="bDual" title="Double vue : deux sources côte à côte (D)">◫</button>
+     <button id="bFull" title="Plein écran (F) — STOP et flèches marchent toujours">⛶</button>
+    </div>
+    <div class="hud bl"><span class="chip" id="hudLine" hidden></span></div>
+    <button class="btn" id="fsStop">■ STOP</button>
+   </div>
    <div class="row">
-    <label>Largeur <select id="w"><option>160</option><option selected>320</option><option>480</option><option>640</option></select></label>
-    <label>Qualité <input id="q" type="number" min="10" max="95" step="5" value="50"></label>
-    <label>Images/s <select id="fps"><option>5</option><option selected>10</option><option>15</option><option>30</option></select></label>
-    <button class="btn ghost" id="snap">📷 Photo</button>
-    <span id="vstats" class="hint"></span>
+    <span id="pick" class="hint"></span>
+    <span style="flex:1"></span>
+    <details id="flux"><summary>⚙ Flux <span id="vstats"></span></summary>
+     <div class="row" style="margin-top:0">
+      <label>Largeur <select id="w"><option>160</option><option selected>320</option><option>480</option><option>640</option></select></label>
+      <label>Qualité <input id="q" type="number" min="10" max="95" step="5" value="50"></label>
+      <label>Images/s <select id="fps"><option>5</option><option selected>10</option><option>15</option><option>30</option></select></label>
+      <button class="btn ghost sm" id="reco">↻ Reconnecter</button>
+     </div>
+    </details>
    </div>
   </section>
   <section class="card" id="hsvCard" hidden>
-   <h2>Vision — réglage de la couleur <span id="hsvName"></span></h2>
-   <div class="hint" style="margin-bottom:8px">Les pixels détectés apparaissent en couleur vive. Vise : la bande entière, et rien d'autre <b>sous la ligne orange</b> (zone utilisée par le suivi).</div>
+   <h2>Couleur <span id="hsvName"></span></h2>
+   <div class="hint" style="margin-bottom:8px"><b>Clique sur la bande dans l'image</b> : sa couleur est ajoutée au masque. Les pixels détectés apparaissent en couleur vive. Vise : la bande entière, et rien d'autre <b>sous la ligne orange</b> (zone utilisée par le suivi).</div>
    <div class="hsv" id="hsvSliders"></div>
    <div class="row"><button class="btn" id="hsvSave">Enregistrer dans le YAML</button>
+    <button class="btn ghost" id="hsvUndo" disabled>↶ Annuler le clic</button>
     <button class="btn ghost" id="hsvReset">Recharger depuis le YAML</button><span id="hsvMsg" class="hint"></span></div>
   </section>
  </div>
  <div class="stack">
   <section class="card">
    <h2>Mission</h2>
-   <select id="mission" style="width:100%;padding:7px"></select>
-   <div class="params" id="params"></div>
-   <div class="row" style="margin-top:0">
+   <div class="mlist" id="mbtns"></div>
+   <select id="mission" hidden></select>
+   <details id="pdet"><summary>Réglages (<span id="pcount">0</span>)</summary>
+    <div class="params" id="params"></div>
+    <button class="btn ghost sm" id="saveParams">Enregistrer ces réglages dans le YAML</button>
+   </details>
+   <div class="row">
     <button class="btn go" id="start">▶ Lancer</button>
-    <button class="btn ghost" id="saveParams">Enregistrer ces réglages</button>
     <span class="status" id="mstatus"></span>
    </div>
    <button class="btn" id="stop">■ STOP <span class="hint" style="color:#fff">(espace)</span></button>
   </section>
   <section class="card">
-   <h2>Logs</h2>
+   <h2>Logs <span class="sp"></span><button class="btn ghost sm" id="logClear">Effacer</button></h2>
    <pre id="log"></pre>
   </section>
   <section class="card">
@@ -592,61 +690,113 @@ input[type=range]{width:100%;accent-color:var(--acc)}
     <button data-k="left">◀</button><button data-k="down">▼</button><button data-k="right">▶</button>
    </div>
    <div class="row"><label>Vitesse <input id="tv" type="number" min="0.02" max="0.15" step="0.01" value="0.08"> m/s</label></div>
+   <div class="hint" style="margin-top:8px">Raccourcis : <b>espace</b> STOP · <b>1-7</b> source vidéo · <b>F</b> plein écran · <b>D</b> double vue · <b>G</b> repères · <b>V</b> gel · <b>P</b> photo</div>
   </section>
  </div>
 </main>
 <script>
 const $=id=>document.getElementById(id);
-const SOURCES=[['camera','Caméra'],['debug','Debug mission'],['mask-yellow','Masque jaune'],['mask-white','Masque blanc'],['mask-red','Masque rouge (STOP)'],['mask-barrier','Masque barrière']];
-let src='camera', missions={}, logNext=0, hsv={}, running=false;
+const SOURCES=[['auto','Auto'],['camera','Caméra'],['debug','Debug mission'],['mask-yellow','Jaune'],['mask-white','Blanc'],['mask-red','Rouge (STOP)'],['mask-barrier','Barrière']];
+const SRCNAME=Object.fromEntries(SOURCES);
+let src='auto', src2='debug', missions={}, logNext=0, hsv={}, running=false, paused=false, lastLog='', undo=[], roiTop=0.55;
 const store={get(k,d){try{return JSON.parse(localStorage.getItem('rh_'+k))??d}catch(e){return d}},set(k,v){try{localStorage.setItem('rh_'+k,JSON.stringify(v))}catch(e){}}};
 async function api(path,body){const r=await fetch(path,body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();if(j.error)throw new Error(j.error);return j}
+const stopAll=()=>api('/api/stop',{}).catch(()=>{});
 
 // ---------- vidéo
-function setSrc(s){src=s;store.set('src',s);for(const b of $('srcTabs').children)b.classList.toggle('on',b.dataset.s===s);
-  const m=s.startsWith('mask-');$('hsvCard').hidden=!m;if(m)buildHsv(s.slice(5));restart()}
-function restart(){$('video').src=`/stream.mjpg?src=${src}&w=${$('w').value}&q=${$('q').value}&fps=${$('fps').value}&t=${Date.now()}`;
-  store.set('video',{w:$('w').value,q:$('q').value,fps:$('fps').value})}
-for(const [s,l] of SOURCES){const b=document.createElement('button');b.textContent=l;b.dataset.s=s;b.onclick=()=>setSrc(s);$('srcTabs').appendChild(b)}
+const streamUrl=s=>`/stream.mjpg?src=${s}&w=${$('w').value}&q=${$('q').value}&fps=${$('fps').value}&t=${Date.now()}`;
+const pickable=()=>!paused&&(src==='camera'||src.startsWith('mask-'));
+function setSrc(s){if(!SRCNAME[s])s='auto';src=s;store.set('src',s);for(const b of $('srcTabs').children)b.classList.toggle('on',b.dataset.s===s);
+  const m=s.startsWith('mask-');$('hsvCard').hidden=!m;undo=[];$('hsvUndo').disabled=true;$('mark').hidden=true;if(m)buildHsv(s.slice(5));restart()}
+function restart(){paused=false;$('bPause').textContent='⏸';$('bPause').classList.remove('on');$('video').src=streamUrl(src);
+  if(!$('view1').hidden)$('video2').src=streamUrl(src2);
+  store.set('video',{w:$('w').value,q:$('q').value,fps:$('fps').value});pickHint()}
+function pickHint(){$('frame').classList.toggle('pick',pickable());
+  if(src.startsWith('mask-'))$('pick').textContent='Clique sur la bande dans l\'image pour ajouter sa couleur au masque.';
+  else if(src==='camera'){if(!$('pick').dataset.keep)$('pick').textContent='Clique dans l\'image pour lire la couleur (HSV) d\'un point.'}
+  else{$('pick').textContent='';delete $('pick').dataset.keep}}
+SOURCES.forEach(([s,l],i)=>{if(i===3){const sp=document.createElement('span');sp.className='sep';sp.textContent='Masques';$('srcTabs').appendChild(sp)}
+  const b=document.createElement('button');b.dataset.s=s;b.append(l);const k=document.createElement('kbd');k.textContent=i+1;b.appendChild(k);
+  b.onclick=()=>setSrc(s);$('srcTabs').appendChild(b);
+  const o=document.createElement('option');o.value=s;o.textContent=l;$('src2').appendChild(o)});
 const vs=store.get('video',{});for(const k of ['w','q','fps'])if(vs[k])$(k).value=vs[k];
 for(const id of ['w','q','fps'])$(id).onchange=restart;
-$('video').onerror=()=>setTimeout(restart,1500);
-$('snap').onclick=()=>{const a=document.createElement('a');a.href=`/snapshot.jpg?src=${src.startsWith('mask')?'camera':src}`;a.download=`robot_${Date.now()}.jpg`;a.click()};
+$('reco').onclick=restart;
+$('video').onerror=()=>{if(!paused)setTimeout(()=>{if(!paused)restart()},1500)};
+$('video2').onerror=()=>setTimeout(()=>{if(!$('view1').hidden)$('video2').src=streamUrl(src2)},1500);
+function snap(){const a=document.createElement('a');a.href=`/snapshot.jpg?src=${src.startsWith('mask')?'camera':src}`;a.download=`robot_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.jpg`;a.click()}
+function togglePause(){const img=$('video');
+  if(!paused){if(!img.naturalWidth)return;try{const c=document.createElement('canvas');c.width=img.naturalWidth;c.height=img.naturalHeight;
+      c.getContext('2d').drawImage(img,0,0);img.src=c.toDataURL('image/jpeg',.92)}catch(e){return}
+    paused=true;$('bPause').textContent='▶';$('bPause').classList.add('on');pickHint()}
+  else restart()}
+function toggleGrid(on){const f=$('frame');on=on??!f.classList.contains('grid');f.classList.toggle('grid',on);$('bGrid').classList.toggle('on',on);store.set('grid',on)}
+function toggleDual(on){const v=$('view1');on=on??v.hidden;v.hidden=!on;$('stage').classList.toggle('dual',on);$('bDual').classList.toggle('on',on);store.set('dual',on);
+  if(on)$('video2').src=streamUrl(src2);else $('video2').removeAttribute('src');layout()}
+function toggleFull(){if(document.fullscreenElement)document.exitFullscreen();else $('stage').requestFullscreen?.().catch(()=>{})}
+$('bSnap').onclick=snap;$('bPause').onclick=togglePause;$('bGrid').onclick=()=>toggleGrid();$('bDual').onclick=()=>toggleDual();$('bFull').onclick=toggleFull;
+$('src2').onchange=()=>{src2=$('src2').value;store.set('src2',src2);$('video2').src=streamUrl(src2)};
+// cadre posé exactement sur l'image affichée (repères, clics)
+function layout(){const img=$('video'),v=$('view0'),f=$('frame'),nw=img.naturalWidth,nh=img.naturalHeight;if(!nw){f.style.width='0';return}
+  const s=Math.min(v.clientWidth/nw,v.clientHeight/nh);f.style.width=nw*s+'px';f.style.height=nh*s+'px';
+  f.style.left=(v.clientWidth-nw*s)/2+'px';f.style.top=(v.clientHeight-nh*s)/2+'px';$('roiLine').style.top=roiTop*100+'%'}
+window.addEventListener('resize',layout);document.addEventListener('fullscreenchange',()=>setTimeout(layout,50));$('video').addEventListener('load',layout);
+// clic dans l'image : couleur du point (caméra) ou ajout au masque
+$('frame').onclick=async e=>{if(!pickable())return;const r=$('frame').getBoundingClientRect();const x=(e.clientX-r.left)/r.width,y=(e.clientY-r.top)/r.height;
+  try{const p=await api(`/api/pixel?x=${x.toFixed(4)}&y=${y.toFixed(4)}`);const mk=$('mark');mk.hidden=false;mk.style.left=x*100+'%';mk.style.top=y*100+'%';
+    const el=$('pick');el.textContent='';const sw=document.createElement('span');sw.id='swatch';sw.style.background=`rgb(${p.rgb})`;
+    el.append(sw,`H ${p.hsv[0]}  S ${p.hsv[1]}  V ${p.hsv[2]}`);el.dataset.keep=1;
+    if(src.startsWith('mask-')){extend(src.slice(5),p.hsv);el.append('  → ajouté au masque')}
+  }catch(err){$('pick').textContent='✖ '+err.message}};
+function extend(p,[h,s,v]){const lo=hsv[p][0],hi=hsv[p][1];undo.push(JSON.stringify(hsv[p]));$('hsvUndo').disabled=false;const M=5;
+  if(lo[0]<=hi[0]){ // plage simple ; si le point est plus proche « en faisant le tour » (rouge), la plage fait le tour
+    if(h<lo[0]){if(h+180-hi[0]<lo[0]-h)hi[0]=Math.min(180,h+M);else lo[0]=Math.max(0,h-M)}
+    else if(h>hi[0]){if(lo[0]+180-h<h-hi[0])lo[0]=Math.max(0,h-M);else hi[0]=Math.min(180,h+M)}}
+  else if(h<lo[0]&&h>hi[0]){if(lo[0]-h<h-hi[0])lo[0]=Math.max(0,h-M);else hi[0]=Math.min(180,h+M)}
+  for(const [i,x] of [[1,s],[2,v]]){lo[i]=Math.min(lo[i],Math.max(0,x-30));hi[i]=Math.max(hi[i],Math.min(255,x+30))}
+  buildHsv(p);pushHsv(p)}
 
 // ---------- vision HSV
 const HN=['H','S','V'],HM=[180,255,255];
-function buildHsv(p){$('hsvName').textContent={yellow:'jaune',white:'blanche',red:'rouge',barrier:'de la barrière'}[p];const box=$('hsvSliders');box.innerHTML='';
+function buildHsv(p){$('hsvName').textContent={yellow:'jaune',white:'blanche',red:'rouge (STOP)',barrier:'de la barrière'}[p];const box=$('hsvSliders');box.innerHTML='';
   if(!hsv[p])return;
   ['min','max'].forEach((mm,j)=>HN.forEach((n,i)=>{const lab=document.createElement('span');lab.textContent=`${n} ${mm}`;
     const r=document.createElement('input');r.type='range';r.min=0;r.max=HM[i];r.value=hsv[p][j][i];
     const v=document.createElement('span');v.className='v';v.textContent=r.value;
     r.oninput=()=>{v.textContent=r.value;hsv[p][j][i]=+r.value;pushHsv(p)};box.append(lab,r,v)}));
   if(p==='red')$('hsvMsg').textContent='rouge : H min > H max = la teinte fait le tour (170 → 10), normal';else $('hsvMsg').textContent=''}
-let hsvTimer=null;function pushHsv(p){clearTimeout(hsvTimer);hsvTimer=setTimeout(()=>api('/api/hsv',{preset:p,lo:hsv[p][0],hi:hsv[p][1]}),80)}
+let hsvTimer=null;function pushHsv(p){clearTimeout(hsvTimer);hsvTimer=setTimeout(()=>api('/api/hsv',{preset:p,lo:hsv[p][0],hi:hsv[p][1]}).catch(()=>{}),80)}
 async function loadHsv(){hsv=await api('/api/hsv');if(src.startsWith('mask-'))buildHsv(src.slice(5))}
 $('hsvSave').onclick=async()=>{const p=src.slice(5);try{await api('/api/hsv/save',{preset:p});$('hsvMsg').textContent='✔ enregistré'}catch(e){$('hsvMsg').textContent='✖ '+e.message}};
-$('hsvReset').onclick=async()=>{await loadHsv();const p=src.slice(5);await api('/api/hsv',{preset:p,lo:hsv[p][0],hi:hsv[p][1]});$('hsvMsg').textContent='rechargé'};
+$('hsvReset').onclick=async()=>{await loadHsv();const p=src.slice(5);await api('/api/hsv',{preset:p,lo:hsv[p][0],hi:hsv[p][1]});undo=[];$('hsvUndo').disabled=true;$('hsvMsg').textContent='rechargé'};
+$('hsvUndo').onclick=()=>{const p=src.slice(5);if(!undo.length)return;hsv[p]=JSON.parse(undo.pop());$('hsvUndo').disabled=!undo.length;buildHsv(p);pushHsv(p)};
 
 // ---------- missions
 function paramValues(){const o={};for(const inp of $('params').querySelectorAll('input[type=number]'))o[inp.dataset.k]=+inp.value;return o}
-function buildParams(){const m=missions[$('mission').value];const box=$('params');box.innerHTML='';
-  const saved=store.get('params_'+$('mission').value,{});
+function buildParams(){const cur=$('mission').value,m=missions[cur];const box=$('params');box.innerHTML='';
+  for(const b of $('mbtns').children)b.classList.toggle('on',b.dataset.m===cur);
+  const saved=store.get('params_'+cur,{});$('pcount').textContent=m.params.length;
   for(const p of m.params){const lab=document.createElement('label');lab.textContent=p.label;
     const r=document.createElement('input');r.type='range';r.min=p.min;r.max=p.max;r.step=p.step;
     const n=document.createElement('input');n.type='number';n.min=p.min;n.max=p.max;n.step=p.step;n.dataset.k=p.key;
     n.value=r.value=(saved[p.key]??p.value);r.oninput=()=>{n.value=r.value;keep()};n.oninput=()=>{r.value=n.value;keep()};
     box.append(lab,r,n)}
-  store.set('mission',$('mission').value)}
+  store.set('mission',cur)}
 function keep(){store.set('params_'+$('mission').value,paramValues())}
-async function loadMissions(){missions=await api('/api/missions');const sel=$('mission');sel.innerHTML='';
-  for(const [k,m] of Object.entries(missions)){const o=document.createElement('option');o.value=k;o.textContent=m.label;sel.appendChild(o)}
-  sel.value=store.get('mission','follow');buildParams()}
-$('mission').onchange=buildParams;
+async function loadMissions(){missions=await api('/api/missions');const sel=$('mission'),box=$('mbtns');sel.innerHTML='';box.innerHTML='';
+  for(const [k,m] of Object.entries(missions)){const o=document.createElement('option');o.value=k;o.textContent=m.label;sel.appendChild(o);
+    const b=document.createElement('button');b.dataset.m=k;const i=m.label.indexOf(' : ');
+    const t=document.createElement('b');t.textContent=i<0?m.label:m.label.slice(0,i);b.appendChild(t);
+    if(i>=0){const s=document.createElement('small');s.textContent=m.label.slice(i+3);b.appendChild(s)}
+    b.onclick=()=>{if(running)return;sel.value=k;buildParams()};box.appendChild(b)}
+  sel.value=store.get('mission','piste');if(!missions[sel.value])sel.value=Object.keys(missions)[0];buildParams()}
 $('start').onclick=async()=>{try{await api('/api/start',{mission:$('mission').value,params:paramValues()});
-  if(!src.startsWith('mask'))setSrc($('mission').value==='enclosure'?'camera':'debug')}catch(e){alert(e.message)}};
-$('stop').onclick=()=>api('/api/stop',{});
+  if(src==='camera')setSrc('auto')}catch(e){alert(e.message)}};
+$('stop').onclick=$('hstop').onclick=$('fsStop').onclick=stopAll;
 $('saveParams').onclick=async()=>{try{await api('/api/params/save',{mission:$('mission').value,params:paramValues()});
   store.set('params_'+$('mission').value,{});await loadMissions()}catch(e){alert(e.message)}};
+$('pdet').open=store.get('pdet',false);$('pdet').ontoggle=()=>store.set('pdet',$('pdet').open);
+$('logClear').onclick=()=>{$('log').textContent=''};
 
 // ---------- téléop
 const KEYS={up:[1,0],down:[-1,0],left:[0,1],right:[0,-1]};const held=new Set();let teleTimer=null;
@@ -658,30 +808,56 @@ function release(k){held.delete(k);document.querySelector(`.pad [data-k=${k}]`)?
 for(const b of document.querySelectorAll('.pad button')){const k=b.dataset.k;
   b.onpointerdown=e=>{e.preventDefault();press(k)};b.onpointerup=b.onpointerleave=b.onpointercancel=()=>release(k)}
 const AK={ArrowUp:'up',ArrowDown:'down',ArrowLeft:'left',ArrowRight:'right'};
-document.addEventListener('keydown',e=>{if(e.target.tagName==='INPUT'&&e.target.type!=='range')return;
-  if(e.code==='Space'){e.preventDefault();api('/api/stop',{});return}
-  if(AK[e.key]){e.preventDefault();if(!e.repeat)press(AK[e.key])}});
-document.addEventListener('keyup',e=>{if(AK[e.key])release(AK[e.key])});
+const typing=e=>(e.target.tagName==='INPUT'&&e.target.type!=='range')||e.target.tagName==='SELECT'||e.target.tagName==='TEXTAREA';
+const HOT={f:toggleFull,g:()=>toggleGrid(),v:togglePause,p:snap,d:()=>toggleDual()};
+document.addEventListener('keydown',e=>{if(e.code==='Space'&&!(e.target.tagName==='INPUT'&&e.target.type==='number')){e.preventDefault();stopAll();return}
+  if(typing(e)||e.ctrlKey||e.metaKey||e.altKey)return;
+  if(AK[e.key]){e.preventDefault();if(!e.repeat)press(AK[e.key]);return}
+  if(e.repeat)return;const k=e.key.toLowerCase();
+  if(HOT[k]){e.preventDefault();HOT[k]()}else if(k>='1'&&k<=String(SOURCES.length)){e.preventDefault();setSrc(SOURCES[+k-1][0])}});
+document.addEventListener('keyup',e=>{if(e.code==='Space')e.preventDefault();if(AK[e.key])release(AK[e.key])});
 window.addEventListener('blur',()=>{for(const k of [...held])release(k)});
+// un bouton ou une liste qui garde le focus avalerait espace (STOP) et les flèches : on le lâche tout de suite
+document.addEventListener('click',e=>{e.target.closest?.('button,summary')?.blur()});
+document.addEventListener('change',e=>{if(e.target.tagName==='SELECT')e.target.blur()});
 
 // ---------- état
 function dot(id,age,limit=1.0){$(id).className='dot '+(age===null?'':age<limit?'ok':'warn')}
 function addLog(lines){const el=$('log');const atEnd=el.scrollTop+el.clientHeight>=el.scrollHeight-20;
   for(const [,l] of lines){const s=document.createElement('span');
     s.className=/ERROR|Erreur|erreur|Traceback|ECHEC|failed/i.test(l)?'err':/ARRIVÉE|✔|SUCCESS|terminée \(code 0\)/.test(l)?'ok':l.startsWith('$')?'cmd':'';
-    s.textContent=l+'\n';el.appendChild(s)}
+    s.textContent=l+'\n';el.appendChild(s);if(!l.startsWith('$'))lastLog=l}
   while(el.childNodes.length>500)el.removeChild(el.firstChild);if(atEnd)el.scrollTop=el.scrollHeight}
-async function poll(){try{const s=await api(`/api/state?since=${logNext}`);logNext=s.log_next;addLog(s.log);
+const fresh=v=>v.age!==null&&v.age<1.0;
+function videoHud(s){const key=src==='auto'?(fresh(s.video.debug)?'debug':'camera'):src.startsWith('mask')?'camera':src;const v=s.video[key],live=$('live');
+  $('srcName').textContent=src==='auto'?`Auto → ${key==='debug'?'debug mission':'caméra'}`:SRCNAME[src];
+  const none=v.age===null,stale=!none&&v.age>1.5;
+  if(paused){live.textContent='⏸ image gelée';live.className='chip warn'}
+  else if(none){live.textContent='pas d\'image';live.className='chip bad'}
+  else if(stale){live.textContent=`IMAGE FIGÉE depuis ${v.age.toFixed(0)} s`;live.className='chip bad'}
+  else{live.textContent=`● direct · retard ${(v.age*1000).toFixed(0)} ms · ${v.in_fps.toFixed(0)} i/s`;live.className='chip '+(v.age<0.5?'ok':'warn')}
+  $('view0').classList.toggle('stale',stale&&!paused);$('empty').hidden=!none||paused;
+  if(none){$('emptyT').textContent=key==='debug'?'Pas d\'image de debug':'Aucune image de la caméra';
+    $('emptyS').textContent=key==='debug'?'Elle n\'arrive que pendant une mission. L\'onglet Auto bascule tout seul dessus.':'Rien reçu sur le topic caméra depuis le démarrage du panneau.'}
+  $('vstats').textContent=none?'':`· reçu ${v.in_size==='?'?'':v.in_size+' · '}${v.in_kbps.toFixed(0)} kb/s`;
+  const m=s.mission,parts=[];if(m.running)parts.push(`● ${m.name} ${m.elapsed} s`);
+  if(s.robot.odom_age!==null&&s.robot.odom_age<1)parts.push(`v ${s.robot.v.toFixed(2)}  w ${s.robot.w.toFixed(2)}`);
+  if(lastLog&&m.name)parts.push(lastLog);$('hudLine').textContent=parts.join('   ·   ');$('hudLine').hidden=!parts.length;layout()}
+async function poll(){try{const s=await api(`/api/state?since=${logNext}`);logNext=s.log_next;addLog(s.log);roiTop=s.roi_top??roiTop;
   const r=s.robot;dot('d-odom',r.odom_age);dot('d-scan',r.scan_age);
-  const c=s.video.camera;dot('d-cam',c.age,1.5);$('camfps').textContent=c.age!==null&&c.age<1.5?`${c.in_fps.toFixed(0)} i/s · ${c.in_kbps.toFixed(0)} kb/s`:'';
+  const c=s.video.camera;dot('d-cam',c.age,1.5);$('camfps').textContent=c.age!==null&&c.age<1.5?`${c.in_fps.toFixed(0)} i/s`:'';
   if(r.battery!==null){$('bat').textContent=r.battery.toFixed(1)+' V';$('d-bat').className='dot '+(r.battery>11.3?'ok':r.battery>10.8?'warn':'')}
+  const low=r.battery!==null&&r.battery_age!==null&&r.battery_age<10&&r.battery<=11.0;$('banner').hidden=!low;if(low)$('banner').textContent=`Batterie faible : ${r.battery.toFixed(1)} V`;
   $('speed').textContent=r.odom_age!==null&&r.odom_age<1?`v=${r.v.toFixed(2)} m/s  w=${r.w.toFixed(2)} rad/s`:'';
-  const v=s.video[src.startsWith('mask')?'camera':src];$('vstats').textContent=v.age===null?(src==='debug'?'(image debug : seulement pendant une mission de piste)':'aucune image'):v.age>1.5?`plus d'image depuis ${v.age.toFixed(0)} s`:`retard ${(v.age*1000).toFixed(0)} ms`;
-  running=s.mission.running;$('start').disabled=running;$('mission').disabled=running;
-  $('mstatus').textContent=running?`● ${s.mission.name} en cours (${s.mission.elapsed} s)`:s.mission.name?`terminée (code ${s.mission.exit_code})`:'';
-  $('mstatus').style.color=running?'var(--ok)':'var(--dim)';
- }catch(e){for(const d of ['d-odom','d-scan','d-cam','d-bat'])$(d).className='dot';$('mstatus').textContent='panneau arrêté ?'}}
-loadMissions();loadHsv();setSrc(store.get('src','camera'));poll();setInterval(poll,500);
+  running=s.mission.running;$('start').disabled=running;for(const b of $('mbtns').children)b.disabled=running;
+  const st=running?`● ${s.mission.name} en cours (${s.mission.elapsed} s)`:s.mission.name?`terminée (code ${s.mission.exit_code})`:'';
+  for(const id of ['mstatus','hmission']){$(id).textContent=st;$(id).style.color=running?'var(--ok)':'var(--dim)'}
+  document.title=running?`● ${s.mission.name} — RobotHub`:'RobotHub Panneau';
+  videoHud(s);
+ }catch(e){for(const d of ['d-odom','d-scan','d-cam','d-bat'])$(d).className='dot';$('mstatus').textContent=$('hmission').textContent='panneau arrêté ?';
+  $('live').textContent='panneau injoignable';$('live').className='chip bad'}}
+src2=store.get('src2','debug');if(!SRCNAME[src2])src2='debug';$('src2').value=src2;
+loadMissions();loadHsv();setSrc(store.get('src','auto'));toggleGrid(store.get('grid',false));toggleDual(store.get('dual',false));poll();setInterval(poll,500);
 </script></body></html>"""
 
 

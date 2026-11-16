@@ -4,9 +4,16 @@
 (numérotation BCM, par défaut GPIO18). Coupure automatique après `max_on_time`
 secondes pour ne pas faire chauffer la bobine.
 
-Sur le Pi (Ubuntu 22.04) :  sudo apt install python3-gpiozero python3-lgpio
+Aucune bibliothèque GPIO à installer : sans gpiozero, la broche est pilotée directement par
+/dev/gpiochip0 (accessible au groupe dialout, dont fait partie l'utilisateur ubuntu). Le robot n'a
+pas internet sur le routeur, donc pas d'apt install possible.
+Ce fichier est autonome : ~/robot.sh le copie sur le robot et le lance (python3 fichier.py).
 Si le module est câblé sur l'OpenCR et non sur le Pi, ce nœud ne s'applique pas.
 """
+import fcntl
+import os
+import struct
+
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Bool
@@ -20,15 +27,49 @@ class _DryPin:
         pass
 
 
+class _ChipPin:
+    """Sortie GPIO par le périphérique caractère du noyau (ioctl gpiohandle, sans bibliothèque)."""
+    _GET_LINEHANDLE = 0xC16CB403
+    _SET_VALUES = 0xC040B409
+
+    def __init__(self, pin, chip='/dev/gpiochip0'):
+        chip_fd = os.open(chip, os.O_RDONLY)
+        try:
+            # struct gpiohandle_request : lineoffsets[64], flags (2 = sortie), default_values[64],
+            # consumer_label[32], lines, fd
+            req = bytearray(struct.pack('64II64s32sIi', *([pin] + [0] * 63), 2, bytes(64), b'robothub_aimant', 1, 0))
+            fcntl.ioctl(chip_fd, self._GET_LINEHANDLE, req)
+            self.fd = struct.unpack_from('i', req, 360)[0]
+        finally:
+            os.close(chip_fd)
+
+    def _set(self, v):
+        fcntl.ioctl(self.fd, self._SET_VALUES, bytearray(struct.pack('64s', bytes([v]))))
+
+    def on(self):
+        self._set(1)
+
+    def off(self):
+        self._set(0)
+
+
+def open_pin(pin):
+    """-> (objet avec on()/off(), nom du pilote utilisé)."""
+    try:
+        from gpiozero import DigitalOutputDevice
+        return DigitalOutputDevice(pin, initial_value=False), 'gpiozero'
+    except Exception:
+        return _ChipPin(pin), '/dev/gpiochip0'
+
+
 class Electromagnet(Node):
     def __init__(self):
         super().__init__('electromagnet')
         pin = self.declare_parameter('gpio_pin', 18).value
         self.max_on = self.declare_parameter('max_on_time', 60.0).value
         try:
-            from gpiozero import DigitalOutputDevice
-            self.dev = DigitalOutputDevice(pin, initial_value=False)
-            self.get_logger().info(f'électroaimant sur GPIO{pin}')
+            self.dev, how = open_pin(pin)
+            self.get_logger().info(f'électroaimant sur GPIO{pin} ({how})')
         except Exception as e:  # pas sur un Pi : mode simulation
             self.get_logger().warn(f'GPIO indisponible ({e}) -> mode simulation')
             self.dev = _DryPin()

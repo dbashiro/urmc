@@ -46,28 +46,24 @@ class Scenario:
     group: str
 
 
-def _track(mission):
-    return f'ros2 run robothub track_mission --ros-args --params-file {CONFIG} -p mission:={mission}'
+TRACK = f'ros2 run robothub track_mission --ros-args --params-file {CONFIG}'   # une seule mission piste
 
 
 SCENARIOS = [
-    Scenario('piste-droite', 'Piste : ligne droite + damier', _track('straight'),
-             'fake_track_sim.py straight', 'piste'),
-    Scenario('piste-virage', 'Piste : virage + panneau STOP', _track('curve'),
-             'fake_track_sim.py curve', 'piste'),
-    Scenario('piste-aleatoire', 'Piste : tracé aléatoire (S) + damier', _track('straight'),
-             'fake_track_sim.py random', 'piste'),
-    Scenario('barriere', 'Barrière : arrêt puis reprise', _track('barrier'),
-             'fake_track_sim.py straight --barrier', 'piste'),
-    Scenario('intersection', 'Intersection : priorité à droite', _track('intersection'),
-             'fake_track_sim.py straight --robot-right', 'piste'),
-    Scenario('carrefour', 'Carrefour fig. 3 : tout droit', _track('intersection'),
-             'fake_track_sim.py cross', 'piste'),
-    Scenario('carrefour-priorite', 'Carrefour fig. 3 + robot 2 à droite', _track('intersection'),
+    Scenario('piste-droite', 'Piste : ligne droite + damier', TRACK, 'fake_track_sim.py straight', 'piste'),
+    Scenario('piste-virage', 'Piste : virage + STOP sur le côté (3 s) + damier', TRACK, 'fake_track_sim.py curve', 'piste'),
+    Scenario('piste-virage-stop-gauche', 'Piste : virage + STOP à gauche (3 s) + damier', TRACK,
+             'fake_track_sim.py curve --sign left', 'piste'),
+    Scenario('piste-virage-stop-milieu', 'Piste : virage + STOP au milieu (arrêt définitif)', TRACK,
+             'fake_track_sim.py curve --sign center', 'piste'),
+    Scenario('piste-aleatoire', 'Piste : tracé aléatoire (S) + damier', TRACK, 'fake_track_sim.py random', 'piste'),
+    Scenario('barriere', 'Barrière : arrêt puis reprise', TRACK, 'fake_track_sim.py straight --barrier', 'piste'),
+    Scenario('carrefour', 'Carrefour fig. 3 : tout droit', TRACK, 'fake_track_sim.py cross', 'piste'),
+    Scenario('carrefour-priorite', 'Carrefour fig. 3 + robot 2 à droite', TRACK,
              'fake_track_sim.py cross --robot-right', 'piste'),
-    Scenario('parcours', 'Parcours : barrière + carrefour tout droit + virage + STOP', _track('parcours'),
+    Scenario('parcours', 'Parcours : barrière + carrefour + virage + STOP (3 s) + damier', TRACK,
              'fake_track_sim.py parcours', 'piste'),
-    Scenario('parcours-priorite', 'Parcours + robot 2 à droite au carrefour', _track('parcours'),
+    Scenario('parcours-priorite', 'Parcours + robot 2 à droite au carrefour', TRACK,
              'fake_track_sim.py parcours --robot-right', 'piste'),
     Scenario('enclos-fixe', 'Enclos : figure 4 du règlement',
              f'ros2 run robothub enclosure_mission --ros-args --params-file {CONFIG}',
@@ -77,7 +73,7 @@ SCENARIOS = [
              'fake_enclosure_sim.py --layout random', 'enclos'),
     Scenario('enclos-puis-piste', 'Enclos (LiDAR) puis suivi de ligne jusqu\'au damier',
              f'ros2 run robothub enclosure_mission --ros-args --params-file {CONFIG} -p handoff:=true -p exit_extra:=0.05 & '
-             f'ros2 run robothub track_mission --ros-args --params-file {CONFIG} -p mission:=straight '
+             f'ros2 run robothub track_mission --ros-args --params-file {CONFIG} -p barrier:=false -p priority:=false -p stop_on_stop_sign:=false '
              f'-p start_topic:=/robothub/enclosure_done -p start_delay:=0.3 & wait',
              'fake_enclosure_sim.py --layout fixed --track', 'enclos'),
     Scenario('stockage', 'Stockage : palette ① -> ②',
@@ -141,7 +137,10 @@ def run_one(scn, seed, level, view=False, out_dir=None, on_line=None, stop_event
     mission = sim = None
     try:
         with open(log_dir / 'mission.log', 'w') as mlog:
-            mission = subprocess.Popen(ros_shell(scn.mission), stdout=mlog, stderr=subprocess.STDOUT,
+            # ROBOTHUB_MISSION_ARGS='-p slam:=false' : paramètres ajoutés à la mission (comparaisons A/B)
+            extra = os.environ.get('ROBOTHUB_MISSION_ARGS', '')
+            cmd = scn.mission.replace(' & ', f' {extra} & ', 1) if ' & ' in scn.mission else f'{scn.mission} {extra}'
+            mission = subprocess.Popen(ros_shell(cmd if extra else scn.mission), stdout=mlog, stderr=subprocess.STDOUT,
                                        env=env, start_new_session=True, cwd=PKG)
             sim = subprocess.Popen(ros_shell(sim_cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    env=env, start_new_session=True, cwd=HERE, text=True, bufsize=1)

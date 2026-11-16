@@ -74,6 +74,42 @@ def test_stop_sign():
     assert vision.detect_stop_sign(square, rp) == 0.0
 
 
+def test_stop_sign_rejects_other_red_objects():
+    rp = vision.RedParams()
+
+    def scene(draw):
+        img = track_image(0)
+        draw(img)
+        return vision.detect_stop_sign(img, rp)
+    assert scene(lambda i: cv2.circle(i, (250, 60), 22, RED, -1)) == 0.0                 # disque sans barre
+    assert scene(lambda i: cv2.rectangle(i, (230, 40), (275, 80), RED, -1)) == 0.0       # objet carré
+    assert scene(lambda i: cv2.rectangle(i, (0, 20), (50, 239), RED, -1)) == 0.0         # pull / pied au bord
+    assert scene(lambda i: cv2.fillPoly(i, [np.array([(250, 30), (280, 80), (220, 80)])], RED)) == 0.0
+
+    def boxed(i):  # carré rouge avec une barre blanche : la barre ne suffit pas, il faut un disque
+        cv2.rectangle(i, (230, 40), (275, 80), RED, -1)
+        cv2.rectangle(i, (238, 56), (267, 64), WHITE, -1)
+    assert scene(boxed) == 0.0
+
+
+def test_stop_sign_real_image():
+    """Vraie image du robot (12/11) : panneau posé au milieu de la piste, rouge sombre."""
+    import os
+    img = cv2.imread(os.path.join(os.path.dirname(__file__), 'data', 'stop_reel_20261112.jpg'))
+    rp = vision.RedParams()
+    sign = vision.find_stop_sign(img, rp)
+    assert sign is not None and sign['bar']
+    x, y, w, h = sign['rect']
+    assert abs(x + w / 2 - 152) < 6 and abs(y + h / 2 - 185) < 6
+    assert 0.014 < sign['area_frac'] < 0.020
+    for gain in (0.5, 0.7, 1.4, 1.8):   # salle plus sombre / plus claire
+        assert vision.detect_stop_sign(cv2.convertScaleAbs(img, alpha=gain), rp) > 0.014, gain
+    for k in (0.5, 0.7, 1.3):           # plus loin / plus près : la taille mesurée suit
+        a = vision.detect_stop_sign(cv2.resize(img, None, fx=k, fy=k, interpolation=cv2.INTER_AREA),
+                                    vision.RedParams(work_width=int(320 * k)))
+        assert 0.014 < a < 0.020, k
+
+
 def test_barrier_board_with_legs():
     bp = vision.BarrierParams()
     img = track_image(0)
@@ -412,3 +448,33 @@ def test_lane_survives_dim_light():
     for _ in range(3):
         r = on.process(dim)
     assert r.found and abs(r.error) < 0.1
+
+
+# --------------------------------------------------------------------------- enclos : SLAM
+
+def test_enclosure_slam_corrects_odometry_drift():
+    """Trajet dans l'enclos avec une odométrie qui dérive fort en cap (comme des roues de diamètres
+    différents) : la pose corrigée par le SLAM doit rester à quelques cm / degrés de la vraie."""
+    from robothub.enclosure_slam import GridSlam
+    slam = GridSlam()
+    obstacles = [(0.9, 0.35, 0.06), (0.6, 0.75, 0.05)]
+    x, y, yaw = -0.35, 0.75, 0.0                 # départ devant l'entrée ; repère carte = pose de départ
+    ox = oy = oyaw = 0.0
+    worst = (0.0, 0.0)
+    # (avance m, rotation rad) par pas de 0,2 s : entrée, puis une boucle dans l'enclos
+    moves = [(0.024, 0.0)] * 35 + [(0.0, -0.06)] * 12 + [(0.024, 0.0)] * 18 + [(0.0, 0.06)] * 40 + \
+            [(0.024, 0.0)] * 20 + [(0.0, 0.06)] * 30 + [(0.024, 0.0)] * 25
+    for k, (dv, dw) in enumerate(moves):
+        yaw += dw
+        x, y = x + dv * math.cos(yaw), y + dv * math.sin(yaw)
+        oyaw += dw * 1.04 + dv * 0.35            # odométrie : +4 % en rotation, 20°/m de dérive en avançant
+        ox, oy = ox + dv * math.cos(oyaw), oy + dv * math.sin(oyaw)
+        r, a = _enclosure_scan(x, y, yaw, obstacles, noise=0.01, seed=k)
+        slam.update(r, a, (ox, oy, oyaw), w=dw / 0.2)
+        ex, ey, eyaw = slam.apply((ox, oy, oyaw))
+        worst = (max(worst[0], math.hypot(ex - (x + 0.35), ey - (y - 0.75))),
+                 max(worst[1], abs(math.atan2(math.sin(eyaw - yaw), math.cos(eyaw - yaw)))))
+    drift = abs(math.atan2(math.sin(oyaw - yaw), math.cos(oyaw - yaw)))
+    assert drift > math.radians(25)              # l'odométrie seule est vraiment fausse
+    assert worst[0] < 0.06 and worst[1] < math.radians(5), worst
+    assert slam.matched > 100 and slam.rejected < 10

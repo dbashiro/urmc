@@ -8,6 +8,25 @@ def _invalid(msg, r):
     return ~np.isfinite(r) | (r < max(msg.range_min, 0.05)) | (r > msg.range_max)
 
 
+def _isolated_close(r, bad, near=0.30, tol=0.10, k=2):
+    """Échos proches (< near) isolés : aucun des ±k faisceaux voisins n'a d'écho à moins de tol de
+    cette distance. Un vrai objet à moins de 30 cm couvre plusieurs faisceaux (1° = 5 mm à 30 cm) ;
+    le LDS-01 du robot 9 (14/11) sort des distances fantômes d'un seul faisceau (0.13 m devant,
+    rien autour) qui déclenchaient « barrière » sans arrêt."""
+    close = ~bad & (r < near)
+    support = np.zeros(r.size, bool)
+    for s in list(range(-k, 0)) + list(range(1, k + 1)):
+        rn, bn = np.roll(r, s), np.roll(bad, s)
+        support |= ~bn & (np.abs(rn - r) < tol)
+    return close & ~support
+
+
+def _bad(msg, r):
+    """Faisceaux sans mesure exploitable : invalides, ou échos fantômes isolés."""
+    bad = _invalid(msg, r)
+    return bad | _isolated_close(r, bad)
+
+
 def _near_neighbors(r, bad, near, k=2):
     """Faisceaux invalides voisins (±k) d'un écho valide plus proche que `near`."""
     close = ~bad & (r < near)
@@ -39,7 +58,7 @@ def scan_arrays(msg, far=None):
     robot : on le met à range_min ; les autres 0 = libre (`far`)."""
     r = np.asarray(msg.ranges, dtype=np.float32)
     far = msg.range_max if far is None else far
-    bad = _invalid(msg, r)
+    bad = _bad(msg, r)
     too_close = _near_neighbors(r, bad, msg.range_min + 0.06)
     if msg.angle_increment > 0:
         too_close |= _close_runs(r, bad, msg.range_min + 0.04, int(math.radians(100) / msg.angle_increment))
@@ -56,15 +75,22 @@ class ScanFilter:
     Donner `yaw` (odométrie) : la mémoire suit la rotation du robot, sinon un faisceau qui
     voyait un mur et pointe maintenant vers une ouverture resterait « bouché »."""
 
-    def __init__(self, hold_near=0.20, hold_time=0.6):
+    def __init__(self, hold_near=0.20, hold_time=0.6, fill_time=0.0):
         self.hold_near, self.hold_time = hold_near, hold_time
+        # fill_time > 0 : un faisceau sans écho reprend sa dernière vraie mesure si elle a moins de
+        # fill_time s. Le LDS-01 du robot 9 (14/11) publie des tours tronqués : tout le début du tour
+        # à 0 (jusqu'à 348 faisceaux sur 360), DEVANT le robot — lus comme « libre », ces trous
+        # faisaient voir des portes dans les murs. Une vraie ouverture n'a pas d'écho récent : elle
+        # reste libre (elle apparaît seulement avec fill_time s de retard quand elle entre dans le champ).
+        self.fill_time = fill_time
+        self.filled = 0             # faisceaux rebouchés au dernier scan
         self.last = None
         self.last_t = None
         self.yaw = None
 
     def __call__(self, msg, now, yaw=None):
         raw = np.asarray(msg.ranges, dtype=np.float32)
-        bad = _invalid(msg, raw)
+        bad = _bad(msg, raw)
         if self.last is None or self.last.size != raw.size:
             self.last = np.full(raw.size, np.inf, np.float32)
             self.last_t = np.full(raw.size, -np.inf)
@@ -81,6 +107,14 @@ class ScanFilter:
         # dernière distance vue (au plus hold_near) : exacte si le faisceau a juste été perdu, et proche
         # de range_min si l'objet est passé dessous
         r = np.where(held, np.minimum(r, np.maximum(self.last, msg.range_min)), r).astype(np.float32)
+        if self.fill_time > 0:
+            # seulement le bloc vide du début d'un tour tronqué (>= 20 faisceaux à partir du n° 0) : un
+            # scan sain n'est pas touché
+            lead = int(np.argmin(bad)) if not bad.all() else bad.size
+            in_lead = np.arange(bad.size) < (lead if lead >= 20 else 0)
+            fill = in_lead & bad & ~held & np.isfinite(self.last) & (now - self.last_t < self.fill_time)
+            r = np.where(fill, np.maximum(self.last, msg.range_min), r).astype(np.float32)
+            self.filled = int(fill.sum())
         # on ne rafraîchit la mémoire qu'avec de vrais échos (les faisceaux tenus gardent leur date)
         self.last = np.where(bad, self.last, raw)
         self.last_t = np.where(bad, self.last_t, now)

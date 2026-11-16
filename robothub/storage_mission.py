@@ -202,7 +202,7 @@ class StorageMission(Node):
         self.aisle_yaw = None
         self.approach = None
         self.started = False
-        self.scan_filter = lidar.ScanFilter()
+        self.scan_filter = lidar.ScanFilter(fill_time=1.2)   # tours LiDAR tronqués : voir lidar.ScanFilter
         self.odom_t = -1e9
         self.t0 = self.now()
         self.create_timer(0.05, self.control)

@@ -3,6 +3,7 @@
 Tout ici est indépendant de ROS (testable avec de simples images OpenCV).
 """
 import glob
+import math
 import os
 from dataclasses import dataclass, field
 
@@ -293,41 +294,87 @@ class LaneDetector:
 
 @dataclass
 class RedParams:
-    lo: tuple = (170, 110, 70)     # rouge : la teinte fait le tour 170 -> 10
+    # rouge : la teinte fait le tour 170 -> 10. Seuils larges (rouge sombre ou délavé accepté) :
+    # c'est la forme qui fait le tri, pas la couleur.
+    lo: tuple = (170, 90, 40)
     hi: tuple = (10, 255, 255)
-    min_area_px: int = 60
+    min_area_px: int = 40
     work_width: int = 320
-    max_sign_fill: float = 0.88    # au-delà : rectangle plein (rayure de barrière), pas un disque
+    # forme : disque vu de face ou un peu écrasé (caméra inclinée, carton penché)
+    min_aspect: float = 0.7        # largeur / hauteur
+    max_aspect: float = 2.0
+    min_solidity: float = 0.88     # aire / aire de l'enveloppe convexe : un disque est convexe
+    min_fill: float = 0.62         # enveloppe / rectangle englobant : disque = 0.79,
+    max_fill: float = 0.90         # rectangle plein (rayure, objet carré) = 1.0
+    bar_min_h: int = 16            # panneau plus haut que ça (px) : la barre blanche doit être visible
+    border: int = 2                # coupé par le bord de l'image : forme non fiable -> ignoré
 
 
-def red_blobs(bgr, rp):
+def red_mask(bgr, rp):
     img = resize_to_width(bgr, rp.work_width)
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    m = hsv_mask(hsv, rp.lo, rp.hi)
-    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-    contours = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
-    blobs = []
-    for c in contours:
-        a = cv2.contourArea(c)
-        if a < rp.min_area_px:
+    return hsv_mask(cv2.cvtColor(img, cv2.COLOR_BGR2HSV), rp.lo, rp.hi)
+
+
+def _has_bar(center):
+    """Bande centrale (en largeur) du masque rouge d'un candidat : y a-t-il, de haut en bas, du
+    rouge, puis une barre non rouge vers le milieu, puis du rouge ?"""
+    red = (center > 0).mean(axis=1) > 0.5          # par ligne : rouge ou non
+    n = len(red)
+    gaps = np.flatnonzero(~red)
+    gaps = gaps[(gaps > 0.25 * n) & (gaps < 0.75 * n)]   # lignes non rouges de la partie centrale
+    if gaps.size == 0:
+        return False
+    top, bot = int(gaps[0]), int(gaps[-1])
+    thick = bot - top + 1
+    return bool(gaps.size == thick and thick <= 0.4 * n               # une seule barre, pas trop épaisse
+                and red[:top].mean() > 0.7 and red[bot + 1:].mean() > 0.7)
+
+
+def find_stop_sign(bgr, rp):
+    """Panneau « sens interdit » (disque rouge à barre blanche, figure 6) -> dict(area_frac, rect, bar)
+    du plus gros trouvé, ou None. rect = (x, y, w, h) dans l'image réduite à rp.work_width.
+
+    Trois vérifications, pour ne pas s'arrêter devant n'importe quel objet rouge :
+    - contour convexe et proportions d'un disque ;
+    - il remplit son rectangle englobant comme une ellipse (un rectangle plein est écarté) ;
+    - dès qu'il est assez gros pour la voir : barre horizontale non rouge au milieu, rouge
+      au-dessus et en dessous.
+    area_frac = aire de l'ellipse inscrite dans le rectangle englobant / aire de l'image : ne dépend
+    ni de la barre ni des trous du masque, et grossit régulièrement quand le robot approche."""
+    raw = red_mask(bgr, rp)
+    ih, iw = raw.shape
+    # fermeture : recolle les deux demi-disques quand la barre les sépare (panneau petit ou flou)
+    closed = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    best = None
+    for c in cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]:
+        area = cv2.contourArea(c)
+        if area < rp.min_area_px:
             continue
         x, y, bw, bh = cv2.boundingRect(c)
-        blobs.append(dict(area=a, rect=(x, y, bw, bh), fill=a / float(bw * bh),
-                          area_frac=a / float(img.shape[0] * img.shape[1]),
-                          shape=img.shape[:2]))
-    return blobs
+        if x < rp.border or y < rp.border or x + bw > iw - rp.border or y + bh > ih - rp.border:
+            continue
+        if not rp.min_aspect <= bw / bh <= rp.max_aspect:
+            continue
+        hull = cv2.contourArea(cv2.convexHull(c))
+        if hull <= 0 or area / hull < rp.min_solidity:
+            continue
+        if not rp.min_fill <= hull / float(bw * bh) <= rp.max_fill:
+            continue
+        bar = None
+        if bh >= rp.bar_min_h:
+            bar = _has_bar(raw[y:y + bh, x + int(0.35 * bw):x + max(int(0.65 * bw), int(0.35 * bw) + 1)])
+            if not bar:
+                continue
+        area_frac = math.pi / 4 * bw * bh / float(ih * iw)
+        if best is None or area_frac > best['area_frac']:
+            best = dict(area_frac=area_frac, rect=(x, y, bw, bh), bar=bar)
+    return best
 
 
 def detect_stop_sign(bgr, rp):
-    """Panneau rond rouge (sens interdit de la figure 6) -> fraction de l'image occupée (0 si absent).
-    Un disque remplit ~79 % de son rectangle englobant (moins avec la barre blanche) ; une
-    rayure de barrière, presque carrée vue de loin, le remplit à plus de 90 % : on l'écarte."""
-    best = 0.0
-    for b in red_blobs(bgr, rp):
-        _, _, bw, bh = b['rect']
-        if 0.6 < bw / bh < 1.6 and 0.5 < b['fill'] < rp.max_sign_fill:
-            best = max(best, b['area_frac'])
-    return best
+    """-> fraction de l'image occupée par le panneau STOP (0 si absent). Voir find_stop_sign."""
+    sign = find_stop_sign(bgr, rp)
+    return sign['area_frac'] if sign else 0.0
 
 
 @dataclass

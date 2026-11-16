@@ -149,6 +149,10 @@ def lidar_effects(ranges, level, rng, range_min=0.12, range_max=3.5):
     bad = ~hit | (r < range_min) | (r > range_max)
     if level.lidar_drop:
         bad |= rng.random(r.shape) < level.lidar_drop
+    # tours tronqués (vrai LDS-01 du robot 9, 14/11) : avec cette probabilité, tout le début du tour est à 0
+    trunc = float(os.environ.get('ROBOTHUB_SIM_SCAN_TRUNC', 0) or 0)
+    if trunc and rng.random() < trunc:
+        bad[:int(rng.integers(30, 350))] = True
     return [0.0 if b else float(v) for v, b in zip(r, bad)]
 
 

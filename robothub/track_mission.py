@@ -1,16 +1,14 @@
-"""Missions de suivi de piste (jour 1) — épreuves 0, 1 et 2 du règlement.
+"""Mission piste (jour 1) — épreuves 0, 1 et 2 du règlement, en une seule mission.
 
-    mission:=straight      ligne droite, arrêt sur le damier                (épreuve 0, partie 1)
-    mission:=curve         droite + virage, arrêt devant le panneau rouge  (épreuve 0, partie 2)
-    mission:=barrier       arrêt devant la barrière, repart quand elle s'ouvre (épreuve 1)
-    mission:=intersection  priorité à droite à l'intersection              (épreuve 2)
-    mission:=follow        suivi de piste seul (réglages)
-    mission:=parcours      les 4 d'un coup : barrière, carrefour tout droit avec priorité à droite,
-                           virage, arrêt au panneau STOP (damiers ignorés : checker_count:=N pour
-                           s'arrêter au N-ième)
+Le robot suit la piste (ligne droite, virages) et gère tout seul ce qu'il rencontre :
+    barrière       arrêt devant, repart quand elle s'ouvre                       (épreuve 1)
+    intersection   priorité à droite puis traversée tout droit                   (épreuve 2)
+    damier         arrêt dessus (checker_count:=N : au N-ième ; 0 : les ignorer) (épreuve 0)
+    panneau STOP   sur le côté de la piste : arrêt de 3 s devant, puis on repart ;
+                   au milieu de la piste : arrêt définitif devant                (épreuve 0)
 
-Les drapeaux stop_on_checker / stop_on_stop_sign / barrier / priority sont pré-réglés
-par mission et peuvent être forcés en paramètre.
+Chaque détection se coupe par paramètre si besoin (ex. -p barrier:=false) :
+stop_on_checker / stop_on_stop_sign / barrier / priority.
 """
 import math
 
@@ -28,28 +26,14 @@ from robothub.common import (Beeper, bgr_to_compressed, declare_dataclass, image
                              subscribe_camera, yaw_from_quat)
 from robothub.motion import clamp, wrap
 
-PRESETS = {
-    'straight':     dict(stop_on_checker=True,  stop_on_stop_sign=False, barrier=False, priority=False),
-    'curve':        dict(stop_on_checker=False, stop_on_stop_sign=True,  barrier=False, priority=False),
-    'barrier':      dict(stop_on_checker=True,  stop_on_stop_sign=True,  barrier=True,  priority=False),
-    'intersection': dict(stop_on_checker=True,  stop_on_stop_sign=True,  barrier=False, priority=True),
-    'follow':       dict(stop_on_checker=False, stop_on_stop_sign=False, barrier=False, priority=False),
-    'parcours':     dict(stop_on_checker=True,  stop_on_stop_sign=True,  barrier=True,  priority=True),
-}
-
-
 class TrackMission(Node):
     def __init__(self):
         super().__init__('track_mission')
         dp = lambda n, v: self.declare_parameter(n, v).value  # noqa: E731
-        self.mission = dp('mission', 'straight')
-        if self.mission not in PRESETS:
-            raise ValueError(f'mission inconnue {self.mission!r}, choix : {list(PRESETS)}')
-        flags = {k: dp(k, v) for k, v in PRESETS[self.mission].items()}
-        self.stop_on_checker = flags['stop_on_checker']
-        self.stop_on_stop_sign = flags['stop_on_stop_sign']
-        self.use_barrier = flags['barrier']
-        self.use_priority = flags['priority']
+        self.stop_on_checker = dp('stop_on_checker', True)
+        self.stop_on_stop_sign = dp('stop_on_stop_sign', True)
+        self.use_barrier = dp('barrier', True)
+        self.use_priority = dp('priority', True)
 
         # conduite
         self.max_speed = dp('max_speed', 0.12)        # m/s (max robot 0.22)
@@ -62,7 +46,23 @@ class TrackMission(Node):
         self.lost_timeout = dp('lost_timeout', 1.2)   # s tout droit sans voir de ligne (intersection)
         # fin de parcours
         self.confirm_frames = dp('confirm_frames', 3)
-        self.stop_sign_area = dp('stop_sign_area', 0.012)  # fraction d'image : plus grand = s'arrête plus près
+        self.stop_sign_area = dp('stop_sign_area', 0.008)  # fraction d'image : plus grand = s'arrête plus près
+        # panneau sur le côté de la piste : on marque l'arrêt stop_sign_wait s puis on repart (0 : arrêt
+        # définitif). « Sur le côté » = centre du panneau à plus de stop_sign_side (fraction de la largeur
+        # d'image) du milieu de l'image ; en dessous il est au milieu de la piste : arrêt définitif.
+        # panneau sur le côté : il sort de l'image (bord gauche/droit/bas) AVANT d'atteindre stop_sign_area
+        # (vrai robot, 14/11 : 0.003 au mieux pour un seuil de 0.008). On s'arrête donc aussi dès qu'il
+        # arrive à moins de stop_sign_edge (fraction de l'image) d'un bord, s'il fait au moins
+        # stop_sign_min_area (écarte les petites taches rouges lointaines). stop_sign_edge 0 : désactivé.
+        self.stop_sign_edge = dp('stop_sign_edge', 0.10)
+        self.stop_sign_min_area = dp('stop_sign_min_area', 0.0015)
+        self.stop_sign_wait = dp('stop_sign_wait', 3.0)
+        self.stop_sign_side = dp('stop_sign_side', 0.15)
+        self.stop_sign_clear = dp('stop_sign_clear', 0.5)  # m après être reparti sans regarder les panneaux
+        self.stop_ignore_until = 0.0
+        self.stop_cmd_t = 0.0
+        self.stop_t0 = None
+        self.speed = 0.0
         # la caméra voit le damier avant que le robot n'y soit : on continue de X m (odométrie) pour s'arrêter dessus
         self.checker_overrun = dp('checker_overrun', 0.13)
         # barrière
@@ -99,12 +99,12 @@ class TrackMission(Node):
         # le terme D est ramené à cette période d'image : même réglage à 10 ou 30 images/s
         self.kd_period = dp('kd_period', 1.0 / 15)
         # damier : s'arrêter au N-ième (les précédents sont franchis avec un bip) ; 0 = ne jamais s'arrêter
-        self.checker_count = dp('checker_count', 0 if self.mission == 'parcours' else 1)
+        self.checker_count = dp('checker_count', 1)
         self.checkers_seen = 0
         self.checker_ignore_until = 0.0
         # priorité à droite seulement à l'approche d'un carrefour (bandes qui s'ouvrent vues depuis peu)
         # au lieu de tout le temps — indispensable sur un parcours complet (décor à droite)
-        self.priority_gate = dp('priority_gate', self.mission == 'parcours')
+        self.priority_gate = dp('priority_gate', True)
         self.last_diverge_t = -1e9
         self.debug = dp('debug', True)
         # diagnostic : dossier où enregistrer les images sur lesquelles la piste n'est pas trouvée (150 max), ou vues pendant la traversée d'un carrefour
@@ -124,6 +124,7 @@ class TrackMission(Node):
         self.red = declare_dataclass(self, 'red', vision.RedParams())
         self.barrier = declare_dataclass(self, 'barrier', vision.BarrierParams())
         self.barrier_bottom = None
+        self.sign = None                        # panneau STOP vu dans l'image courante (debug)
 
         self.cmd_pub = self.create_publisher(Twist, dp('cmd_vel_topic', '/cmd_vel'), 10)
         self.dbg_pub = self.create_publisher(CompressedImage, '/robothub/debug/compressed', 2)
@@ -146,7 +147,8 @@ class TrackMission(Node):
         self.t0 = self.now()
         self.scan = None
         self.scan_t = -1e9
-        self.scan_filter = lidar.ScanFilter()
+        self.barrier_why = ''
+        self.scan_filter = lidar.ScanFilter(fill_time=1.2)   # tours LiDAR tronqués : voir lidar.ScanFilter
         self.prev_t = None
         self.odom_xy = None
         self.yaw = None
@@ -166,9 +168,9 @@ class TrackMission(Node):
         self.dist_checker = 0.0
         self.clear_since = None
         self.frame = 0
-        self.get_logger().info(f'Mission {self.mission} : checker={self.stop_on_checker} '
-                               f'stop_sign={self.stop_on_stop_sign} barrier={self.use_barrier} '
-                               f'priority={self.use_priority}')
+        self.get_logger().info(f'Mission piste : damier={self.stop_on_checker} (n° {self.checker_count}) '
+                               f'panneau STOP={self.stop_on_stop_sign} barrière={self.use_barrier} '
+                               f'intersection={self.use_priority}')
 
     def now(self):
         return self.get_clock().now().nanoseconds * 1e-9
@@ -187,6 +189,7 @@ class TrackMission(Node):
             self.dist += math.hypot(p.x - self.odom_xy[0], p.y - self.odom_xy[1])
         self.odom_xy = (p.x, p.y)
         self.yaw = yaw_from_quat(msg.pose.pose.orientation)
+        self.speed = msg.twist.twist.linear.x
 
     def on_start_signal(self, msg):
         if msg.data and self.state == 'WAIT':
@@ -224,6 +227,16 @@ class TrackMission(Node):
         self.publish_debug(lane)
 
     def step(self, img, lane, now):
+        # 0) arrêt marqué devant un panneau STOP sur le côté : les 3 s comptent à partir de l'arrêt réel
+        if self.state == 'STOPSIGN':
+            self.prev_t = None
+            if self.stop_t0 is None and (abs(self.speed) < 0.005 or now - self.stop_cmd_t > 1.0):
+                self.stop_t0 = now
+            if self.stop_t0 is None or now - self.stop_t0 < self.stop_sign_wait:
+                return self.drive(0.0, 0.0)
+            self.stop_ignore_until = self.dist + self.stop_sign_clear
+            self.counts['stop'] = 0
+            self.set_state('FOLLOW', beep=True)
         # 1) fin de parcours
         if self.state == 'OVERRUN':
             # tout droit : les bandes s'arrêtent au damier, le suivi de piste n'a plus de repère
@@ -246,16 +259,30 @@ class TrackMission(Node):
         barrier_bottom = vision.detect_barrier(img, self.barrier) if self.use_barrier else None
         self.barrier_bottom = barrier_bottom
         # une barrière rouge ressemblerait à un panneau : pas de panneau STOP tant qu'on la voit
-        if self.stop_on_stop_sign and barrier_bottom is None:
-            area = vision.detect_stop_sign(img, self.red)
-            if self.confirm('stop', area >= self.stop_sign_area):
-                return self.finish(f'panneau rouge détecté (aire {area:.3f})')
+        self.sign = None
+        if self.stop_on_stop_sign and barrier_bottom is None and self.dist >= self.stop_ignore_until:
+            self.sign = vision.find_stop_sign(img, self.red)
+            area = self.sign['area_frac'] if self.sign else 0.0
+            leaving = self.sign_leaving(img)
+            if self.confirm('stop', area >= self.stop_sign_area or leaving):
+                x, _, bw, _ = self.sign['rect']
+                off = (x + 0.5 * bw) / float(self.red.work_width) - 0.5   # -0.5 bord gauche .. +0.5 bord droit
+                what = f'taille {area:.3f}, à {off:+.2f} du milieu de l\'image'
+                if area < self.stop_sign_area:
+                    what += ', au bord de l\'image'
+                if self.stop_sign_wait <= 0 or abs(off) < self.stop_sign_side:
+                    return self.finish(f'panneau STOP au milieu de la piste ({what})')
+                self.get_logger().info(f'panneau STOP sur le côté ({what}) : arrêt de {self.stop_sign_wait:.0f} s')
+                self.stop_cmd_t, self.stop_t0 = now, None
+                self.set_state('STOPSIGN', beep=True)
+                return self.drive(0.0, 0.0)
 
         # 2) barrière : on attend qu'elle se lève
         if self.use_barrier and self.state != 'OVERRUN':
             blocked = self.barrier_blocked(barrier_bottom)
             if self.state != 'BARRIER' and blocked:
-                self.set_state('BARRIER', beep=True)
+                self.set_state('BARRIER')
+                self.get_logger().info(f'barrière vue par {self.barrier_why}')
             if self.state == 'BARRIER':
                 if self.cleared_for(not blocked, now, self.barrier_clear_time):
                     self.set_state('FOLLOW')
@@ -273,7 +300,7 @@ class TrackMission(Node):
                 return self.drive(0.0, 0.0)
             right, front = self.robot_on_right()
             if self.state != 'PRIORITY' and right:
-                self.set_state('PRIORITY', beep=True)
+                self.set_state('PRIORITY')
             if self.state == 'PRIORITY':
                 if self.cleared_for(not (right or front), now, self.prio_clear_time):
                     self.set_state('FOLLOW')
@@ -389,6 +416,16 @@ class TrackMission(Node):
         self.drive(self.min_speed, 0.0)
 
     # ------------------------------------------------------------------ détections
+    def sign_leaving(self, img):
+        """Le panneau STOP vu (self.sign) est-il sur le point de sortir de l'image (gauche, droite, bas) ?"""
+        if self.sign is None or self.stop_sign_edge <= 0 or self.sign['area_frac'] < self.stop_sign_min_area:
+            return False
+        w = float(self.red.work_width)
+        h = w * img.shape[0] / img.shape[1]
+        x, y, bw, bh = self.sign['rect']
+        m = self.stop_sign_edge
+        return x <= m * w or x + bw >= (1 - m) * w or y + bh >= (1 - m) * h
+
     def confirm(self, key, seen):
         self.counts[key] = self.counts[key] + 1 if seen else 0
         return self.counts[key] >= self.confirm_frames
@@ -411,9 +448,15 @@ class TrackMission(Node):
         scan = self.fresh_scan()
         if self.barrier_lidar_dist > 0 and scan is not None:
             r, a = scan
-            if lidar.sector_min(r, a, -self.barrier_lidar_deg, self.barrier_lidar_deg) < self.barrier_lidar_dist:
+            # une barrière remplit tout le secteur : 3 faisceaux au moins (un écho isolé n'en est pas une)
+            n = lidar.count_below(r, a, -self.barrier_lidar_deg, self.barrier_lidar_deg, self.barrier_lidar_dist)
+            if n >= 3:
+                self.barrier_why = f'LiDAR : {n} faisceaux à moins de {self.barrier_lidar_dist:.2f} m devant'
                 return True
-        return self.barrier_cam_bottom > 0 and bottom is not None and bottom >= self.barrier_cam_bottom
+        if self.barrier_cam_bottom > 0 and bottom is not None and bottom >= self.barrier_cam_bottom:
+            self.barrier_why = f'caméra : bas de la barrière à {bottom:.2f} (seuil {self.barrier_cam_bottom:.2f})'
+            return True
+        return False
 
     def robot_on_right(self):
         scan = self.fresh_scan()
@@ -464,6 +507,12 @@ class TrackMission(Node):
                 cv2.line(d, (0, y), (w, y), (0, 0, 255), 2)
                 cv2.putText(d, f'BARRIERE {self.barrier_bottom:.2f}', (5, max(30, y - 4)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+        if self.sign is not None and self.state != 'DONE':  # panneau STOP vu : cadre + taille / seuil d'arrêt
+            k = d.shape[1] / float(self.red.work_width)
+            x, y, bw, bh = (int(v * k) for v in self.sign['rect'])
+            cv2.rectangle(d, (x, y), (x + bw, y + bh), (0, 0, 255), 1)
+            cv2.putText(d, f"STOP {self.sign['area_frac']:.3f}/{self.stop_sign_area:.3f}", (x, max(28, y - 4)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
         self.dbg_pub.publish(bgr_to_compressed(d))
 
 

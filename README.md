@@ -5,11 +5,7 @@ Un nœud par famille d'épreuves du règlement. Tous les réglages sont dans
 
 | Épreuve (tableau 1)                            | Commande |
 |------------------------------------------------|----------|
-| 0. Ligne droite + arrêt sur le damier          | `ros2 launch robothub track.launch.py mission:=straight` |
-| 0. Virage + arrêt au panneau STOP              | `ros2 launch robothub track.launch.py mission:=curve` |
-| 1. Barrière : arrêt puis reprise               | `ros2 launch robothub track.launch.py mission:=barrier` |
-| 2. Intersection, priorité à droite             | `ros2 launch robothub track.launch.py mission:=intersection` |
-| 0 + 1 + 2 enchaînées (parcours complet)        | `ros2 launch robothub track.launch.py mission:=parcours` |
+| 0, 1, 2. Piste : suivi, virage, barrière, intersection, damier, panneau STOP | `ros2 launch robothub track.launch.py` |
 | 4. Enclos (LiDAR seul, caméra interdite)       | `ros2 launch robothub enclosure.launch.py` |
 | 5. Palette zone ① → zone ②                     | `ros2 launch robothub storage.launch.py` (+ `ros2 run robothub electromagnet` **sur le robot**) |
 
@@ -37,12 +33,18 @@ domaine. `CAMERA=0 ~/robot.sh` pour l'enclos (caméra interdite), `~/robot.sh of
 ```
 (dans le Docker : `ros2 run robothub control_panel`)
 
-- **Vidéo** : caméra, *Debug mission* (bandes détectées, état), masques jaune / blanc / rouge ;
-  largeur, qualité, images/s réglables ; bouton photo.
+- **Vidéo** : onglet *Auto* (image de debug pendant une mission, caméra sinon), *Caméra*,
+  *Debug mission*, masques jaune / blanc / rouge / barrière. Sur l'image : état du flux (retard,
+  « IMAGE FIGÉE depuis N s » si plus rien n'arrive), mission en cours et dernière ligne de log.
+  Boutons en haut à droite : repères (axe + haut de la zone utile), gel, photo, double vue (deux
+  sources côte à côte), plein écran (STOP et flèches marchent toujours). Clic dans l'image :
+  couleur HSV du point. Raccourcis : 1-7 source, F, D, G, V, P. Largeur / qualité / images/s
+  dans « ⚙ Flux ».
 - **Mission** : choisir l'épreuve, régler (vitesse, kp, kd, …, préremplis depuis le YAML),
   ▶ Lancer, logs en direct. **STOP = gros bouton rouge ou barre d'espace.**
   « Enregistrer ces réglages » les écrit dans `config/robothub.yaml` (commentaires conservés).
-- **Vision** : onglet *Masque …* → curseurs HSV, résultat en direct, « Enregistrer dans le YAML ».
+- **Vision** : onglet d'un masque → **cliquer sur la bande dans l'image** ajoute sa couleur au masque
+  (« Annuler le clic » pour revenir), curseurs HSV pour affiner, « Enregistrer dans le YAML ».
   Remplace `hsv_tuner`.
 - **Pilotage manuel** : flèches (maintenir), désactivé pendant une mission.
 - En haut : voyants robot / LiDAR / caméra (débit), tension batterie, vitesse.
@@ -61,20 +63,48 @@ défaut, ~6 Ko par image en 320x240). Enclos : `CAMERA=0 ~/robot.sh` (caméra in
 - **Piste** : arrêt si un obstacle est à moins de `front_guard_dist` (15 cm) devant ; le terme D
   est ramené à `kd_period` (1/15 s), donc même comportement que la caméra tourne à 10 ou 30 i/s.
 
-## Parcours complet (les 4 premières épreuves d'un coup)
+## Mission piste (une seule mission pour les épreuves 0, 1 et 2)
 
-Panneau : « Parcours complet », ou `ros2 launch robothub track.launch.py mission:=parcours`.
-Suivi de ligne + arrêt à la barrière et reprise + carrefour (priorité à droite, traversée tout
-droit) + arrêt au panneau STOP. Les damiers sont franchis (`checker_count:=0`) ; mettre
-`checker_count:=N` pour s'arrêter au N-ième. La priorité à droite et la manœuvre de carrefour ne
-s'activent qu'à l'approche d'un carrefour (bandes qui s'ouvrent des deux côtés), pas sur tout le
-parcours. Simulateur : scénarios `parcours` et `parcours-priorite` (ordre de la figure 3 :
-barrière, carrefour, route d'en face aux couleurs inversées, virage, STOP).
+Panneau : « Piste », ou `ros2 launch robothub track.launch.py`. Le robot suit la ligne (droite,
+virages) et gère ce qu'il rencontre : arrêt à la barrière et reprise, carrefour (priorité à
+droite, traversée tout droit), arrêt sur le damier, panneau STOP.
+**Panneau STOP sur le côté de la piste** : le robot marque l'arrêt `stop_sign_wait` s (3 s, comptées
+à partir de l'arrêt réel) devant le panneau, bipe, puis repart (les panneaux sont ignorés pendant
+`stop_sign_clear` = 0,5 m). **Panneau au milieu de la piste** : arrêt définitif devant. « Sur le
+côté » = centre du panneau à plus de `stop_sign_side` (0.15 = 15 % de la largeur d'image) du milieu
+de l'image ; le log donne la valeur mesurée (`à +0.33 du milieu de l'image` ; en simu ~0.00 au
+milieu, ±0.30 à 0.38 sur le côté). `stop_sign_wait:=0.0` : arrêt définitif dans tous les cas.
+`checker_count` : s'arrêter au N-ième damier (1 par défaut ; 0 = les ignorer, arrêt au panneau
+STOP seulement). Pour couper une détection : `-p barrier:=false`, `priority:=false`,
+`stop_on_checker:=false`, `stop_on_stop_sign:=false`. La priorité à droite et la manœuvre de
+carrefour ne s'activent qu'à l'approche d'un carrefour (bandes qui s'ouvrent des deux côtés).
+
+**Panneau STOP** (`vision.find_stop_sign`) : disque rouge à barre blanche. Un objet rouge n'est
+accepté que s'il est convexe, remplit son rectangle comme une ellipse, et montre une barre non
+rouge au milieu (rouge au-dessus et en dessous). Seuils de couleur larges (`red.lo` / `red.hi`),
+c'est la forme qui trie. L'image de debug encadre le panneau et affiche `STOP taille/seuil` :
+régler `stop_sign_area` en regardant ce chiffre à la distance d'arrêt voulue.
+Image réelle de référence : `test/data/stop_reel_20261112.jpg`.
+
+## Enclos : SLAM
+
+`enclosure_mission` construit une carte de l'enclos au fil des scans et recale chaque scan dessus
+(`robothub/enclosure_slam.py`, maison, rien de plus à lancer). La pose utilisée partout (porte
+d'entrée, porte de sortie, point visé) est l'odométrie corrigée par ce recalage : elle ne dérive
+plus avec les roues. La carte s'affiche dans le panneau, source « Debug mission » (murs en blanc,
+robot en vert, entrée en bleu, sortie en rouge) avec la dérive corrigée ; le log de fin donne le
+bilan (`SLAM : dérive de l'odométrie corrigée 23 cm, +31° (... scans recalés ...)`).
+Un scan pris pendant que le robot tourne à plus de `slam_max_w` (0.4 rad/s) n'est pas utilisé : le
+LDS-01 met 0,2 s à faire un tour, le scan est déformé. `-p slam:=false` : odométrie brute, comme avant.
+
+Tant que la sortie n'est pas trouvée, la porte d'entrée est « murée » pour le planificateur
+(`entry_close_dist`), pour que le robot ne ressorte pas par où il est entré.
 
 ## Enclos puis suivi de ligne
 
 Panneau : mission « Enclos (LiDAR) puis suivi de ligne ». Lance `enclosure_mission handoff:=true`
-et `track_mission start_topic:=/robothub/enclosure_done` (mission straight : s'arrête au damier).
+et `track_mission start_topic:=/robothub/enclosure_done` (barrière, intersection et panneau coupés :
+s'arrête au damier).
 Dans l'enclos, seul le LiDAR pilote ; le suivi de ligne **ne s'abonne pas à la caméra** avant
 d'avoir reçu le signal de sortie (5 cm après la porte, `exit_extra`). La caméra doit donc tourner
 sur le robot (`~/robot.sh`, pas `CAMERA=0`) — **à faire valider par le jury**.
@@ -83,7 +113,7 @@ Si la piste est perdue, le suivi pivote de ±`search_deg` (35°) pour la retrouv
 ## Carrefour (épreuve 2, figure 3 du règlement)
 
 Il faut **traverser tout droit**. D'après la figure, sur la route d'en face les couleurs sont
-inversées : en mission `intersection`, le robot suit donc la bande de gauche et la bande de
+inversées : le robot suit donc la bande de gauche et la bande de
 droite **sans regarder leur couleur** (`lane.any_color`). À l'approche du carré central, les
 bandes s'écartent (l'une part à gauche, l'autre à droite) : seule la piste avant l'écartement
 compte, le robot reste droit. Quand les bandes raccourcissent puis disparaissent (dans le
@@ -95,7 +125,7 @@ carré), il avance au cap de la route (odométrie) jusqu'à retrouver les bandes
 
 1. **Seuils de couleur** : `ros2 run robothub hsv_tuner --ros-args -p preset:=yellow` (puis
    `white`, `red`), touche `p`, recopier dans le YAML. Vérifier le résultat avec
-   `rqt_image_view /robothub/debug/compressed` en lançant `mission:=follow`.
+   l'image « Debug mission » du panneau en lançant la mission piste.
 2. **`checker_overrun`** (0.13 m) : distance parcourue après que la caméra voit le damier,
    pour que le robot s'arrête *dessus*. Dépend de l'inclinaison de la caméra.
 3. **`stop_sign_area`** : plus grand = s'arrête plus près du panneau STOP.
@@ -149,13 +179,25 @@ test/sim_hub.sh --run enclos-aleatoire --seed 4 --level hard --view   # rejouer 
   de piloter le vrai robot, même allumé.
 
 Scénarios : `piste-droite`, `piste-virage`, `piste-aleatoire` (tracés en S tirés au hasard),
-`barriere`, `intersection`, `enclos-fixe` (figure 4), `enclos-aleatoire` (taille, entrée,
+`barriere`, `carrefour`, `carrefour-priorite`, `parcours`, `parcours-priorite`, `enclos-fixe` (figure 4), `enclos-aleatoire` (taille, entrée,
 sortie en bas/droite/haut ; on vérifie qu'un chemin existe), `stockage`.
 
 État au 10/11, campagne complète de 260 essais (10 seeds, real + hard) : 258/260. Piste, barrière,
 intersection, carrefour, parcours : 180/180. Stockage 20/20, enclos-puis-piste 20/20, enclos-fixe
 19/20, enclos-aleatoire 19/20. Point faible connu : l'enclos en hard (timeouts ; sur certains
 tracés le robot ressort par l'entrée, ex. enclos-fixe seed 2).
+
+12/11 (après-midi), STOP sur le côté = arrêt 3 s puis reprise jusqu'au damier (40/40 sur
+piste-virage*, parcours*), et SLAM dans l'enclos. Enclos, 30 seeds real + hard (120 essais) :
+sans SLAM 115/120, avec SLAM 117/120, avec SLAM + entrée murée 115/120 (écarts dans le bruit).
+enclos-fixe 60/60 avec SLAM (59/60 sans). Échecs restants (enclos-aleatoire seeds 4, 22, 24) :
+timeouts devant un passage de ~25 cm entre un obstacle et un mur, sans rapport avec la dérive.
+
+12/11, mission piste unique + nouveau détecteur de panneau STOP (panneau du simulateur refait comme
+le vrai : carton posé au sol, rouge sombre) : piste + enclos-puis-piste 86/90 (5 seeds),
+les 4 échecs étant des arrêts à 6 cm du panneau en hard ; avec `stop_sign_area` 0.012 -> 0.008,
+et le panneau sur le côté de la piste (droite, et variante gauche `piste-virage-stop-gauche`) :
+piste-virage, parcours, parcours-priorite : 80/80 (10 seeds). Pas encore essayé sur le vrai robot.
 
 **Niveaux de réalisme** (`test/sim_core.py`) :
 
@@ -178,11 +220,11 @@ Les trois simulateurs se lancent aussi à la main, en parallèle de la mission :
 
 ```bash
 # suivi de piste, caméra virtuelle (piste de 20 cm, bandes jaune/blanche, damier, panneau)
-ros2 launch robothub track.launch.py mission:=straight &  python3 test/fake_track_sim.py straight
-ros2 launch robothub track.launch.py mission:=curve &     python3 test/fake_track_sim.py curve
-ros2 launch robothub track.launch.py mission:=straight &  python3 test/fake_track_sim.py random --seed 4
-ros2 launch robothub track.launch.py mission:=barrier &   python3 test/fake_track_sim.py straight --barrier
-ros2 launch robothub track.launch.py mission:=intersection &  python3 test/fake_track_sim.py straight --robot-right
+ros2 launch robothub track.launch.py &  python3 test/fake_track_sim.py straight
+ros2 launch robothub track.launch.py &  python3 test/fake_track_sim.py curve
+ros2 launch robothub track.launch.py &  python3 test/fake_track_sim.py random --seed 4
+ros2 launch robothub track.launch.py &  python3 test/fake_track_sim.py straight --barrier
+ros2 launch robothub track.launch.py &  python3 test/fake_track_sim.py parcours --robot-right
 # enclos (aléatoire avec --seed, celui du règlement avec --layout fixed)
 ros2 launch robothub enclosure.launch.py &                python3 test/fake_enclosure_sim.py --seed 3
 # palette : générer d'abord des modèles de panneaux de synthèse

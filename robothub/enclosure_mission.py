@@ -20,6 +20,12 @@ Sortie : le robot est sorti quand il a dépassé la ligne de la porte de sortie 
 `exit_pass` m. En secours (porte non trouvée) : on accumule les points LiDAR proches
 (murs) dans le repère odom ; sorti = hors de l'enveloppe convexe de ces points.
 
+SLAM (`slam`, activé par défaut, voir enclosure_slam.py) : une carte de l'enclos est construite au
+fil des scans et chaque scan est recalé dessus. La pose utilisée partout (porte d'entrée, porte de
+sortie, point visé) est la pose odométrique corrigée par ce recalage : elle ne dérive plus avec les
+roues. La carte est publiée en image sur /robothub/debug/compressed (source « Debug mission » du
+panneau). slam:=false : odométrie brute, comme avant.
+
 Option `detect_entrance_sign` : avant de partir, attend le panneau tunnel avec la
 caméra (1 point), bipe, puis ferme la caméra avant d'entrer dans l'enclos.
 À VALIDER avec le jury : la caméra est interdite pendant la mission.
@@ -38,7 +44,8 @@ from sensor_msgs.msg import LaserScan
 
 from robothub import enclosure_nav as nav
 from robothub import lidar
-from robothub.common import Beeper, image_to_bgr, subscribe_camera, yaw_from_quat
+from robothub.common import Beeper, bgr_to_compressed, image_to_bgr, subscribe_camera, yaw_from_quat
+from robothub.enclosure_slam import GridSlam
 from robothub.motion import clamp, wrap
 
 
@@ -68,7 +75,10 @@ class EnclosureMission(Node):
         self.w_smooth = dp('w_smooth', 0.20)            # évite d'hésiter entre deux trous
         self.entrance_goal = math.radians(dp('entrance_goal_deg', 0.0))
         self.back_excl = math.radians(dp('back_exclusion_deg', 70.0))
-        self.door_side = dp('door_side_dist', 0.30)
+        # entrée : un montant à moins de door_side_dist de chaque côté ET écart total <= door_max_width
+        # + 0.10. 0.30 ne voyait pas une entrée de plus de 60 cm (vrai enclos du 14/11 : 0.69 m).
+        self.door_side = dp('door_side_dist', 0.50)
+        self.entry_pass = dp('entry_pass', 0.20)        # m parcourus après la ligne des montants = entré
         self.exit_extra = dp('exit_extra', 0.20)
         self.wall_range = dp('wall_accumulate_range', 1.0)  # points mémorisés comme « murs » si plus proches
         self.exit_margin = dp('exit_margin', 0.05)          # m hors de l'enveloppe pour déclarer la sortie
@@ -82,11 +92,18 @@ class EnclosureMission(Node):
         self.exit_pass = dp('exit_pass', 0.10)           # m au-delà de la ligne de porte = sorti
         self.exit_goal = dp('exit_goal_dist', 0.30)      # but visé : cette distance derrière la porte
         self.exit_lock = dp('exit_lock_dist', 0.35)      # plus près : la porte n'est plus ré-estimée
+        self.entry_close = dp('entry_close_dist', 0.35)  # mur virtuel sur l'entrée une fois à cette distance (0 : non)
         self.entry_excl = dp('entry_exclusion', 0.45)    # une porte à moins de ça de l'entrée = l'entrée
         self.door_min, self.door_max = dp('door_min_width', 0.25), dp('door_max_width', 0.75)
         self.handoff = dp('handoff', False)            # true : à la sortie, passer la main au suivi de ligne
         self.handoff_topic = dp('handoff_topic', '/robothub/enclosure_done')
         self.start_delay = dp('start_delay', 1.0)
+        # SLAM : pose corrigée par recalage des scans sur une carte (false = odométrie brute)
+        self.slam = GridSlam(max_w=dp('slam_max_w', 0.4)) if dp('slam', True) else None
+        self.slam_debug = dp('slam_debug', True)       # image de la carte sur /robothub/debug/compressed
+        self.odom_pose = None                          # pose odométrique brute
+        self.odom_w = 0.0
+        self.prev_scan_odom = None
         self.verbose = dp('verbose', False)
         self.detect_sign = dp('detect_entrance_sign', False)
         self.sign_label = dp('entrance_sign_label', 'tunnel')
@@ -98,6 +115,8 @@ class EnclosureMission(Node):
         from rclpy.qos import DurabilityPolicy, QoSProfile
         from std_msgs.msg import Bool
         self.Bool = Bool
+        from sensor_msgs.msg import CompressedImage
+        self.dbg_pub = self.create_publisher(CompressedImage, '/robothub/debug/compressed', 2)
         self.done_pub = self.create_publisher(  # « latché » : reçu même par un abonné arrivé après
             Bool, self.handoff_topic, QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.create_subscription(LaserScan, '/scan', self.on_scan, qos_profile_sensor_data)
@@ -119,6 +138,7 @@ class EnclosureMission(Node):
         self.exit = None            # porte de sortie : dict(c, n, width, t, locked) dans le repère odom
         self.entry_xy = None
         self.door_gap = math.inf
+        self.entry_line_dist = 0.0
         self.door_cands = []
         self.last_path = self.last_goal = None
         self.speed_scale = 1.0
@@ -128,7 +148,8 @@ class EnclosureMission(Node):
         self.plan_fail = 0
         self.box_center = None
         self.recover_until = -1e9
-        self.scan_filter = lidar.ScanFilter()
+        # tours LiDAR tronqués (voir lidar.ScanFilter) : rebouchés avec la mesure précédente
+        self.scan_filter = lidar.ScanFilter(fill_time=dp('scan_fill_time', 1.2))
         self.scan_t = self.odom_t = -1e9
         self.sensor_timeout = dp('sensor_timeout', 0.6)  # s sans scan/odom -> arrêt
         self.state = 'SIGN' if self.detect_sign else 'START'
@@ -157,8 +178,13 @@ class EnclosureMission(Node):
     def on_scan(self, msg):
         self.scan_t = self.now()
         self.scan = self.scan_filter(msg, self.scan_t, None if self.pose is None else self.pose[2])
-        self.scan_pose = self.pose
         self.far = msg.range_max - 0.05
+        if self.scan_filter.filled > 30:
+            self.get_logger().warn(f'scan LiDAR incomplet : {self.scan_filter.filled} faisceaux sur {len(msg.ranges)} '
+                                   'repris du scan précédent', throttle_duration_sec=5.0)
+        if self.slam is not None and self.odom_pose is not None and self.state not in ('DONE', 'HANDOFF'):
+            self.slam_update()
+        self.scan_pose = self.pose
         if self.use_planner and self.state == 'INSIDE' and self.pose is not None:
             try:
                 self.replan(self.scan_t)
@@ -171,10 +197,67 @@ class EnclosureMission(Node):
 
     def on_odom(self, msg):
         p = msg.pose.pose.position
-        if self.pose is not None and self.state in ('ENTER', 'INSIDE', 'EXIT'):
-            self.dist += math.hypot(p.x - self.pose[0], p.y - self.pose[1])
-        self.pose = (p.x, p.y, yaw_from_quat(msg.pose.pose.orientation))
+        if self.odom_pose is not None and self.state in ('ENTER', 'INSIDE', 'EXIT'):
+            self.dist += math.hypot(p.x - self.odom_pose[0], p.y - self.odom_pose[1])
+        self.odom_pose = (p.x, p.y, yaw_from_quat(msg.pose.pose.orientation))
+        self.odom_w = msg.twist.twist.angular.z
+        # pose de travail : odométrie corrigée par le SLAM (repère carte), ou odométrie brute
+        self.pose = self.odom_pose if self.slam is None else self.slam.apply(self.odom_pose)
         self.odom_t = self.now()
+
+    def slam_update(self):
+        """Recale le scan qui vient d'arriver sur la carte et met à jour la pose corrigée."""
+        r, a = self.scan
+        # vitesse de rotation pendant le scan : la plus grande entre l'odométrie instantanée et la
+        # rotation mesurée depuis le scan précédent
+        w = abs(self.odom_w)
+        if self.prev_scan_odom is not None and self.scan_t - self.prev_scan_odom[0] > 1e-3:
+            w = max(w, abs(wrap(self.odom_pose[2] - self.prev_scan_odom[1])) / (self.scan_t - self.prev_scan_odom[0]))
+        self.prev_scan_odom = (self.scan_t, self.odom_pose[2])
+        try:
+            self.slam.update(r, a, self.odom_pose, w, self.far)
+        except Exception as e:   # ne doit jamais tuer la mission : on garde la dernière correction
+            self.get_logger().error(f'SLAM : {e!r}', throttle_duration_sec=1.0)
+        self.pose = self.slam.apply(self.odom_pose)
+        if self.verbose:
+            self.get_logger().info(f'SLAM : {self.slam.last}', throttle_duration_sec=1.0)
+        if self.slam_debug and self.slam.origin is not None:
+            self.slam_frame = getattr(self, 'slam_frame', 0) + 1
+            if self.slam_frame % 2 == 0:
+                self.publish_map()
+
+    def publish_map(self):
+        """Image de la carte (vue de dessus, x vers la droite, y vers le haut) : murs en blanc, zone vue
+        en gris, robot en vert, entrée en bleu, sortie en rouge, point visé en jaune."""
+        sl = self.slam
+        k = 2
+        img = np.full((sl.n, sl.n, 3), 40, np.uint8)
+        img[sl.seen] = (90, 90, 90)
+        img[sl.occupied] = (255, 255, 255)
+        img = cv2.resize(img[::-1], None, fx=k, fy=k, interpolation=cv2.INTER_NEAREST)
+
+        def px(p):
+            return (int(round(((p[0] - sl.origin[0]) / sl.res + sl.c) * k)),
+                    int(round((sl.n - 1 - ((p[1] - sl.origin[1]) / sl.res + sl.c)) * k)))
+        if self.entry_xy is not None:
+            cv2.circle(img, px(self.entry_xy), 5, (255, 120, 0), -1)
+        if self.exit is not None:
+            cv2.circle(img, px(self.exit['c']), 5, (0, 0, 255), -1)
+            cv2.line(img, px(self.exit['c']), px(self.exit['c'] + 0.3 * self.exit['n']), (0, 0, 255), 1)
+        if self.target is not None and self.state == 'INSIDE':
+            cv2.circle(img, px(self.target), 3, (0, 255, 255), -1)
+        x, y, yaw = self.pose
+        cv2.circle(img, px((x, y)), int(0.09 / sl.res * k), (0, 220, 0), 1)
+        cv2.line(img, px((x, y)), px((x + 0.15 * math.cos(yaw), y + 0.15 * math.sin(yaw))), (0, 220, 0), 2)
+        # cadrage sur la zone cartographiée
+        ii, jj = np.nonzero(sl.seen[::-1])
+        if len(ii):
+            m = 12
+            img = img[max(0, ii.min() * k - m):(ii.max() + 1) * k + m, max(0, jj.min() * k - m):(jj.max() + 1) * k + m]
+        dx, dy, dth = sl.corr
+        cv2.putText(img, f'{self.state}  derive corrigee {math.hypot(dx, dy) * 100:.0f} cm {math.degrees(dth):+.0f} deg',
+                    (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        self.dbg_pub.publish(bgr_to_compressed(np.ascontiguousarray(img)))
 
     def on_image(self, msg):
         if self.state != 'SIGN':
@@ -295,7 +378,7 @@ class EnclosureMission(Node):
         """À chaque scan : porte de sortie, but, chemin -> point visé (repère odom)."""
         pose = self.scan_pose
         pts, r, a = nav.valid_points(*self.scan, self.far)
-        self.planner.update(r, a, pts)
+        self.planner.update(r, a, self.close_entry(pts, pose))
         if self.exit is None or not self.exit['locked']:
             box = nav.fit_rect(pts, nav.find_walls(pts))
             doors = []
@@ -351,6 +434,21 @@ class EnclosureMission(Node):
         self.speed_scale = clamp((tight - 0.08) / 0.08, 0.5, 1.0)
         self.target = self.to_odom(nav.lookahead(path, self.look if tight > 0.17 else 0.6 * self.look), pose)
         self.target_t = now
+
+    def close_entry(self, pts, pose):
+        """Points du scan + un mur virtuel en travers de la porte d'entrée (pour le planificateur
+        seulement) : tant que la sortie n'est pas trouvée, le but est « dehors » et le plus court
+        chemin pour y aller peut repasser par l'entrée. Posé une fois le robot à plus de entry_close m
+        de l'entrée, pour ne pas s'enfermer dans le mur en la franchissant."""
+        if self.entry_close <= 0 or self.entry_xy is None or self.yaw_entry is None:
+            return pts
+        ex, ey = self.entry_xy
+        if math.hypot(pose[0] - ex, pose[1] - ey) < self.entry_close:
+            return pts
+        nx, ny = -math.sin(self.yaw_entry), math.cos(self.yaw_entry)      # le long du mur de l'entrée
+        wall = np.array([self.to_robot((ex + t * nx, ey + t * ny), pose) for t in np.arange(-0.30, 0.301, 0.02)],
+                        pts.dtype)
+        return np.vstack([pts, wall])
 
     def nav_goal(self, pose):
         if self.exit is not None:
@@ -467,11 +565,15 @@ class EnclosureMission(Node):
     def track_entry(self, r, a, yaw):
         left = lidar.sector_min(r, a, 60, 120)
         right = lidar.sector_min(r, a, -120, -60)
-        in_door = left < self.door_side and right < self.door_side
-        if self.state == 'ENTER' and in_door and left + right < self.door_gap:
+        gap = left + right
+        in_door = left < self.door_side and right < self.door_side and gap < self.door_max + 0.10
+        if self.state == 'ENTER' and in_door and gap < self.door_gap - 0.02:
             # montants au plus près = robot sur la ligne de la porte d'entrée
-            self.door_gap, self.entry_xy = left + right, self.pose[:2]
-        if self.state == 'ENTER' and self.in_door and not in_door:
+            self.door_gap, self.entry_xy, self.entry_line_dist = gap, self.pose[:2], self.dist
+        # entré : les montants ont disparu, ou la ligne des montants est entry_pass m derrière (un mur
+        # de l'enclos juste à côté de l'entrée garde sinon « un mur de chaque côté » indéfiniment)
+        if self.state == 'ENTER' and self.entry_xy is not None and (
+                (self.in_door and not in_door) or self.dist - self.entry_line_dist >= self.entry_pass):
             self.doors += 1
             self.beeper.beep(1)
             self.yaw_entry = self.yaw_goal  # cap d'entrée (pas le cap instantané : le robot peut esquiver)
@@ -523,6 +625,8 @@ class EnclosureMission(Node):
         hull = cv2.convexHull(self.wall_pts)
         if cv2.contourArea(hull) < 0.2:
             return
+        if self.entry_xy is not None and math.hypot(x - self.entry_xy[0], y - self.entry_xy[1]) < self.entry_excl:
+            return   # hors de l'enveloppe mais à la porte d'entrée : ce n'est pas la sortie
         if cv2.pointPolygonTest(hull, (float(x), float(y)), True) < -self.exit_margin:
             self.doors += 1
             self.beeper.beep(1)
@@ -535,6 +639,11 @@ class EnclosureMission(Node):
 
     def finish(self, handoff=False):
         self.drive(0.0, 0.0)
+        if self.slam is not None:
+            dx, dy, dth = self.slam.corr
+            self.get_logger().info(
+                f'SLAM : dérive de l\'odométrie corrigée {math.hypot(dx, dy) * 100:.0f} cm, {math.degrees(dth):+.0f}° '
+                f'({self.slam.matched} scans recalés, {self.slam.rejected} refusés, {self.slam.skipped} ignorés)')
         if handoff:
             self.beeper.beep(1)
             self.done_pub.publish(self.Bool(data=True))
