@@ -100,6 +100,9 @@ class LaneParams:
     checker_band: float = 0.35     # partie basse de la ROI où l'on cherche le damier
     checker_v_max: int = 80        # « noir » = V < checker_v_max
     checker_white_v_min: int = 150
+    checker_white_s_max: int = 70  # « blanc » = aussi peu saturé (la bande jaune n'est pas une case blanche)
+    checker_min_run: int = 5       # une case = au moins 5 px de large (image à 320 px) : les traces fines
+                                   # et les rayures claires du sol noir ne comptent pas
     checker_min_transitions: int = 4
     checker_min_rows: float = 0.30
 
@@ -111,6 +114,7 @@ class LaneResult:
     yellow_rows: int = 0
     white_rows: int = 0
     checker: bool = False
+    checker_ahead: bool = False    # damier vu n'importe où dans la zone utile (plus loin) : ralentir
     diverge_rows: int = 0          # lignes où les bandes s'écartent (carrefour, embranchement)
     reach: float = 0.0             # jusqu'où la piste est vue : 0 = rien, 1 = jusqu'en haut de la zone utile
     debug: np.ndarray = None
@@ -238,17 +242,19 @@ class LaneDetector:
             center = float(np.average(centers, weights=weights))
             res.error = (center - w / 2) / (w / 2) - p.center_offset
         res.checker = self._checker(hsv, res.points, y0, w)
+        res.checker_ahead = res.checker or self._checker(hsv, res.points, y0, w, band=1.0)
         if self.debug:
             res.debug = self._draw(img, y0, res)
         return res
 
-    def _checker(self, hsv, points, y0, w):
+    def _checker(self, hsv, points, y0, w, band=None):
         p = self.p
         nrows = hsv.shape[0]
-        r_start = int(nrows * (1 - p.checker_band))
+        r_start = int(nrows * (1 - (band or p.checker_band)))
         # bandes sans couleur : les cases blanches du damier passent pour des bandes -> pas de bornes
         known = {} if p.any_color else {r - y0: (xy, xw) for r, xy, xw, _ in points}
         v = hsv[:, :, 2]
+        sat = hsv[:, :, 1]
         ok = total = 0
         for r in range(r_start, nrows, 2):
             xy, xw = known.get(r, (None, None))
@@ -257,13 +263,20 @@ class LaneDetector:
             if xr - xl < 10:
                 continue
             seg = v[r, xl:xr]
+            seg_s = sat[r, xl:xr]
             # 3 niveaux pour ignorer le gris : noir=0, blanc=1, sinon on garde la valeur précédente
             lab = np.full(seg.shape, -1, np.int8)
             lab[seg < p.checker_v_max] = 0
-            lab[seg > p.checker_white_v_min] = 1
+            lab[(seg > p.checker_white_v_min) & (seg_s <= p.checker_white_s_max)] = 1
             lab = lab[lab >= 0]
             total += 1
-            if lab.size and np.count_nonzero(np.diff(lab)) >= p.checker_min_transitions:
+            if lab.size == 0:
+                continue
+            # suites de même couleur ; on ne garde que les assez larges (vraies cases)
+            cut = np.flatnonzero(np.diff(lab)) + 1
+            runs = [(seg_[0], len(seg_)) for seg_ in np.split(lab, cut)]
+            big = [c for c, n in runs if n >= p.checker_min_run]
+            if np.count_nonzero(np.diff(big)) >= p.checker_min_transitions:
                 ok += 1
         return total > 0 and ok / total >= p.checker_min_rows
 
@@ -330,6 +343,18 @@ def _has_bar(center):
                 and red[:top].mean() > 0.7 and red[bot + 1:].mean() > 0.7)
 
 
+def _has_text(blob):
+    """Vrai panneau STOP du concours (17/11) : disque rouge avec « STOP » en lettres blanches. Le cœur du
+    disque (moitié centrale en hauteur, 70 % en largeur) a donc une part de pixels non rouges, ni nulle
+    (objet tout rouge) ni dominante (anneau, objet creux)."""
+    h, w = blob.shape
+    core = blob[int(0.25 * h):int(0.75 * h), int(0.15 * w):int(0.85 * w)]
+    if core.size == 0:
+        return False
+    hole = 1.0 - (core > 0).mean()
+    return 0.08 <= hole <= 0.75
+
+
 def find_stop_sign(bgr, rp):
     """Panneau « sens interdit » (disque rouge à barre blanche, figure 6) -> dict(area_frac, rect, bar)
     du plus gros trouvé, ou None. rect = (x, y, w, h) dans l'image réduite à rp.work_width.
@@ -362,7 +387,8 @@ def find_stop_sign(bgr, rp):
             continue
         bar = None
         if bh >= rp.bar_min_h:
-            bar = _has_bar(raw[y:y + bh, x + int(0.35 * bw):x + max(int(0.65 * bw), int(0.35 * bw) + 1)])
+            bar = (_has_bar(raw[y:y + bh, x + int(0.35 * bw):x + max(int(0.65 * bw), int(0.35 * bw) + 1)])
+                   or _has_text(raw[y:y + bh, x:x + bw]))   # sens interdit (barre) ou vrai STOP (lettres)
             if not bar:
                 continue
         area_frac = math.pi / 4 * bw * bh / float(ih * iw)
@@ -386,6 +412,8 @@ class BarrierParams:
     hi: tuple = (130, 255, 170)
     work_width: int = 160
     x_band: tuple = (0.05, 0.95)   # partie de la largeur examinée
+    y_top: float = 0.30            # le haut de l'image (salle, gens, banderoles) est ignoré : seules les
+                                   # lignes sous y_top (0 haut .. 1 bas) peuvent être la barrière
     min_row_frac: float = 0.50     # une ligne d'image « est » la barrière si elle en est remplie à 50 %
     min_rows: float = 0.04         # et il en faut au moins 4 % de la hauteur de l'image
 
@@ -397,7 +425,9 @@ def barrier_rows(bgr, bp):
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
     w = m.shape[1]
     band = m[:, int(bp.x_band[0] * w):int(bp.x_band[1] * w)]
-    return m, (band > 0).mean(axis=1) >= bp.min_row_frac
+    rows = (band > 0).mean(axis=1) >= bp.min_row_frac
+    rows[:int(bp.y_top * len(rows))] = False
+    return m, rows
 
 
 def detect_barrier(bgr, bp):
@@ -409,7 +439,135 @@ def detect_barrier(bgr, bp):
     return (int(np.flatnonzero(rows)[-1]) + 1) / len(rows)
 
 
+# --------------------------------------------------------------------------- panneau tunnel
+
+def find_tunnel_sign(bgr, min_px=10, max_px=70, work_width=320, zooms=(2.0, 1.0, 0.5), levels=range(36, 215, 6)):
+    """Panneau « tunnel » (figure 6 : carré bleu nuit à bord clair, arche claire en ∩ autour d'une
+    ouverture sombre) -> dict(rect=(x, y, w, h) du panneau dans l'image réduite à work_width, score)
+    ou None. min_px / max_px : hauteur de l'arche acceptée (elle fait ~55 % du panneau).
+
+    Reconnu par sa forme, pas par ses couleurs exactes ni par un modèle. On cherche l'arche :
+    - une tache claire, à peu près aussi large que haute ;
+    - en ∩ : claire en haut et sur ses deux jambes, sombre en bas au milieu (l'ouverture) ;
+    - entourée de sombre sur ses quatre côtés (le fond du panneau).
+    L'image est analysée à plusieurs zooms : agrandie pour un panneau lointain (arche de 2 px
+    d'épaisseur), réduite pour un panneau proche (les joints entre les pierres disparaissent) ; et
+    à plusieurs seuils de gris (`levels`) : l'arche n'est séparée du bord clair du panneau que par
+    2-3 px de fond, il faut le bon seuil pour qu'elle forme une tache à elle seule, quel que soit
+    l'éclairage.
+    score = contraste arche / fond du panneau (niveaux de gris, 0-255)."""
+    img = resize_to_width(bgr, work_width)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    best = None
+    for z in zooms:
+        g = gray if z == 1.0 else cv2.resize(gray, None, fx=z, fy=z,
+                                             interpolation=cv2.INTER_CUBIC if z > 1 else cv2.INTER_AREA)
+        H, W = g.shape
+        for level_t in levels:
+            n, lab, stats, _ = cv2.connectedComponentsWithStats((g > level_t).astype(np.uint8), connectivity=8)
+            if n > 1:
+                best = _tunnel_arch(g, z, lab, stats, min_px, max_px, best)
+    return best
+
+
+def _tunnel_arch(g, z, lab, stats, min_px, max_px, best):
+    """Parmi les taches claires `lab` / `stats` de l'image `g` (zoom z) : meilleure arche de tunnel."""
+    H, W = g.shape
+    for k in range(1, len(stats)):
+        x, y, w, h, area = stats[k]
+        # 17/11 : le vrai panneau est carré (arche ~1,2 x plus large que haute, photos test/data/tunnel_reel_*) ;
+        # les faux (lampes du plafond, lettres) sont étroits (w/h ~0.5)
+        if not (max(6, min_px * z) <= h <= max_px * z and 0.95 <= w / h <= 1.7):
+            continue
+        if not 0.30 * w * h <= area <= 0.80 * w * h:
+            continue
+        t = max(2, int(round(0.12 * h)))          # épaisseur du cadre sombre examiné autour de l'arche
+        if x - t < 0 or y - t < 0 or x + w + t > W or y + h + t > H:
+            continue
+        lit = lab[y:y + h, x:x + w] == k
+        level = float(g[y:y + h, x:x + w][lit].mean())
+        dark = g[y - t:y + h + t, x - t:x + w + t] < level - max(22.0, 0.22 * level)   # sombre par rapport à l'arche
+        top = lit[:max(1, int(round(0.28 * h)))].mean()
+        lo = int(0.60 * h)
+        cw = max(1, int(round(0.26 * w)))
+        mid = slice((w - cw) // 2, (w - cw) // 2 + cw)
+        sw = max(1, int(round(0.24 * w)))
+        opening_lit = lit[lo:, mid].mean()
+        opening_dark = dark[t + lo:t + h, t:t + w][:, mid].mean()
+        legs = min(lit[lo:, :sw].mean(), lit[lo:, w - sw:].mean())
+        if top < 0.55 or opening_lit > 0.15 or opening_dark < 0.6 or legs < 0.35:
+            continue
+        if min(dark[:t, t:t + w].mean(), dark[t + h:, t:t + w].mean()) < 0.70:   # fond au-dessus et en dessous
+            continue
+        # à gauche et à droite le fond ne fait que ~10 % de la largeur du panneau (1-2 px de loin, adoucis
+        # par le flou) : on demande seulement une colonne nettement plus sombre que l'arche de chaque côté
+        tx = max(1, int(round(0.08 * w)))
+        soft = level - max(12.0, 0.12 * level)
+        if max(float(g[y:y + h, x - tx:x].mean()), float(g[y:y + h, x + w:x + w + tx].mean())) > soft:
+            continue
+        frame = np.concatenate([g[y - t:y, x:x + w].ravel(), g[y:y + h, x - t:x].ravel(),
+                                g[y:y + h, x + w:x + w + t].ravel()])
+        contrast = level - float(frame.mean())
+        if best is None or contrast > best['score']:
+            # panneau : l'arche occupe ~70 % de sa largeur et ~55 % de sa hauteur, un peu bas
+            sx, sy, sw_, sh = x - 0.21 * w, y - 0.40 * h, 1.42 * w, 1.75 * h
+            best = dict(rect=tuple(int(round(v / z)) for v in (sx, sy, sw_, sh)), score=contrast)
+    return best
+
+
 # --------------------------------------------------------------------------- panneaux par modèles
+
+# ------------------------------------------------------------------ panneaux numérotés (épreuve stockage)
+SIGN_BLUE_LO, SIGN_BLUE_HI = (95, 70, 40), (125, 255, 255)   # disque bleu foncé des panneaux du concours (18/11)
+GLYPH_N = 20
+
+
+def blue_discs(bgr, x_range=(0.0, 1.0)):
+    """Disques bleus (panneaux de zone) -> [(x, y, w, h)] : contour à peu près rond et plein."""
+    m = cv2.inRange(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV), SIGN_BLUE_LO, SIGN_BLUE_HI)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    out, W = [], bgr.shape[1]
+    for c in cs:
+        x, y, w, h = cv2.boundingRect(c)
+        if w < 8 or h < 8 or not 0.7 < w / h < 1.4:
+            continue
+        area, per = cv2.contourArea(c), cv2.arcLength(c, True)
+        if 4 * math.pi * area / (per * per + 1e-9) < 0.6 or not 0.75 < area / (math.pi * w * h / 4) < 1.25:
+            continue
+        if x_range[0] <= (x + w / 2) / W <= x_range[1]:
+            out.append((x, y, w, h))
+    return out
+
+
+def _glyph(bgr, inner=0.8, up=4):
+    """Imagette d'un panneau -> chiffre clair recadré sur sa propre boîte, GLYPH_N x GLYPH_N centré-réduit
+    (None si rien de clair). « Clair » = peu saturé et lumineux, seuil d'Otsu dans le cercle `inner`
+    (fraction du demi-côté : 0.8 = l'intérieur du disque, sans le fond autour)."""
+    big = cv2.resize(bgr, None, fx=up, fy=up, interpolation=cv2.INTER_CUBIC)
+    hsv = cv2.cvtColor(big, cv2.COLOR_BGR2HSV).astype(np.float32)
+    g = (1.0 - hsv[:, :, 1] / 255.0) * (hsv[:, :, 2] / 255.0)
+    H, W = g.shape
+    yy, xx = np.mgrid[:H, :W]
+    mask = ((xx - W / 2) / (W / 2)) ** 2 + ((yy - H / 2) / (H / 2)) ** 2 < inner ** 2
+    vals = (g[mask] * 255).astype(np.uint8).reshape(-1, 1)
+    if vals.size < 16:
+        return None
+    thr = cv2.threshold(vals, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0] / 255.0
+    n, _, st, _ = cv2.connectedComponentsWithStats(((g > thr) & mask).astype(np.uint8))
+    keep = [i for i in range(1, n) if st[i, 3] > 0.3 * H]
+    if not keep:
+        return None
+    x0 = min(st[i, 0] for i in keep)
+    y0 = min(st[i, 1] for i in keep)
+    x1 = max(st[i, 0] + st[i, 2] for i in keep)
+    y1 = max(st[i, 1] + st[i, 3] for i in keep)
+    cx, cy, half = (x0 + x1) / 2, (y0 + y1) / 2, (y1 - y0) * 1.15 / 2
+    k = GLYPH_N / (2 * half)
+    M = np.float32([[k, 0, GLYPH_N / 2 - cx * k], [0, k, GLYPH_N / 2 - cy * k]])
+    out = cv2.warpAffine(g, M, (GLYPH_N, GLYPH_N), borderMode=cv2.BORDER_REPLICATE)
+    return (out - out.mean()) / (out.std() + 1e-6)
+
 
 class SignClassifier:
     """Reconnaissance de panneaux par corrélation avec des images modèles.
@@ -418,15 +576,20 @@ class SignClassifier:
     (ex. zone1_a.png, zone2_proche.png, tunnel_1.png). Capture-les avec
     `ros2 run robothub capture_templates --ros-args -p label:=zone1`."""
 
-    def __init__(self, templates_dir, scales=(0.5, 0.65, 0.8, 1.0, 1.25, 1.5, 1.8), work_width=320):
+    def __init__(self, templates_dir, scales=(0.5, 0.65, 0.8, 1.0, 1.25, 1.5, 1.8), work_width=320, glyph=True):
         self.templates = []
+        self.glyphs = []            # (label, chiffre normalisé) tirés des mêmes modèles : voir _glyph
         self.scales = scales
         self.work_width = work_width
         for f in sorted(glob.glob(os.path.join(os.path.expanduser(templates_dir), '*.png'))):
             label = os.path.basename(f).rsplit('.', 1)[0].split('_')[0]
-            t = cv2.imread(f, cv2.IMREAD_GRAYSCALE)
-            if t is not None:
-                self.templates.append((label, t))
+            c = cv2.imread(f, cv2.IMREAD_COLOR)
+            if c is None:
+                continue
+            self.templates.append((label, cv2.cvtColor(c, cv2.COLOR_BGR2GRAY)))
+            g = _glyph(c, inner=1.5) if glyph else None   # modèle = gros plan du chiffre : tout le cadre compte
+            if g is not None:
+                self.glyphs.append((label, g))
 
     @property
     def labels(self):
@@ -491,7 +654,44 @@ class SignClassifier:
         return v, (x0 + cx / up) / gray.shape[1], scale
 
     def scores(self, bgr, only=None, x_range=(0.0, 1.0)):
-        """-> {label: (meilleur score, boîte)} pour chaque étiquette."""
+        """-> {label: (meilleur score, boîte)} pour chaque étiquette : le meilleur des deux lectures,
+        corrélation avec les modèles (_template_scores) et chiffre recadré (_glyph_scores).
+        La seconde tient quand le panneau est loin/petit, la première quand il est un peu flou :
+        sur les photos du concours (18/11, panneaux bleus 1/2/3) + variantes, 52/53 contre 46/53."""
+        out = self._template_scores(bgr, only, x_range)
+        if self.glyphs:
+            for label, (v, box) in self._glyph_scores(bgr, only, x_range, out).items():
+                if label not in out or v > out[label][0]:
+                    out[label] = (v, box)
+        return out
+
+    def _glyph_scores(self, bgr, only, x_range, tmpl):
+        """Candidats = disques bleus (couleur des panneaux du concours) + boîtes trouvées par les
+        modèles, élargies au disque ; dans chacun, le chiffre clair est recadré sur lui-même puis
+        comparé aux chiffres des modèles : indépendant de la taille du panneau dans l'image."""
+        img = resize_to_width(bgr, self.work_width)
+        H, W = img.shape[:2]
+        cands = blue_discs(img, x_range)
+        for _, (_, (x, y, w, h)) in tmpl.items():
+            cx, cy, r = x + w / 2, y + h / 2, 0.85 * max(w, h)
+            cands.append((int(max(0, cx - r)), int(max(0, cy - r)), int(2 * r), int(2 * r)))
+        out = {}
+        for (x, y, w, h) in cands:
+            crop = img[y:min(H, y + h), x:min(W, x + w)]
+            if crop.shape[0] < 8 or crop.shape[1] < 8:
+                continue
+            g = _glyph(crop)
+            if g is None:
+                continue
+            for label, ref in self.glyphs:
+                if only and label not in only:
+                    continue
+                v = float((g * ref).mean())
+                if label not in out or v > out[label][0]:
+                    out[label] = (v, (x, y, w, h))
+        return out
+
+    def _template_scores(self, bgr, only=None, x_range=(0.0, 1.0)):
         gray = cv2.cvtColor(resize_to_width(bgr, self.work_width), cv2.COLOR_BGR2GRAY)
         x0 = int(x_range[0] * gray.shape[1])
         gray = gray[:, x0:int(x_range[1] * gray.shape[1])]

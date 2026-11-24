@@ -115,10 +115,115 @@ class ScanFilter:
             fill = in_lead & bad & ~held & np.isfinite(self.last) & (now - self.last_t < self.fill_time)
             r = np.where(fill, np.maximum(self.last, msg.range_min), r).astype(np.float32)
             self.filled = int(fill.sum())
+        else:
+            fill = np.zeros(raw.size, bool)
+        self.bad = bad & ~fill          # faisceaux sans vraie mesure dans CE scan (pour CableMask)
+        self.real = ~bad                # faisceaux vraiment mesurés dans CE scan (ni tenus ni rebouchés)
         # on ne rafraîchit la mémoire qu'avec de vrais échos (les faisceaux tenus gardent leur date)
         self.last = np.where(bad, self.last, raw)
         self.last_t = np.where(bad, self.last_t, now)
         return r, a
+
+
+class CableMask:
+    """Faisceaux bouchés par quelque chose d'attaché au robot (17/11 : câble ethernet qui part
+    au-dessus du robot et passe devant le LiDAR). Ces faisceaux ne disent rien du monde : un écho à
+    10-20 cm qui suit le robot (faux obstacle collé, le robot n'ose plus avancer de ce côté) ou un 0
+    (lu « libre » : fausse porte dans un mur). Deux règles, réunies puis élargies de ±dilate faisceaux :
+
+      départ    robot immobile au départ : tout écho à moins de `near` est le câble (rien de réel
+                n'est si près du robot posé au départ)
+      fin       paquet de <= thin faisceaux à moins de `near`, nettement plus près que ses deux
+                voisins : un câble de 6 mm (un montant de porte ou un pylône, vus si près, couvrent
+                bien plus de faisceaux) ; + les faisceaux sans écho qui le prolongent (jusqu'à
+                max_blind) : le câble qui continue sous la portée mini du LiDAR
+    """
+
+    def __init__(self, near=0.20, thin=5, dilate=2, max_blind=30, use_thin=False):
+        # 17/11 soir (vrai robot) : la règle « fin » est coupée par défaut. Avec les tours LiDAR tronqués
+        # (jusqu'à 266 faisceaux sur 360 manquants), un pylône proche n'a plus que quelques vraies
+        # mesures : il passait pour le câble et était MASQUÉ (le robot ne le voyait plus).
+        self.near, self.thin, self.dilate, self.max_blind = near, thin, dilate, max_blind
+        self.use_thin = use_thin
+        self.start = None
+        self.mask = None
+
+    def __call__(self, r, bad, learning=False):
+        """r : distances (après ScanFilter), bad : faisceaux sans vraie mesure,
+        learning : robot immobile au départ. -> masque (True = faisceau du câble)."""
+        n = r.size
+        close = (r < self.near) & ~bad
+        if self.start is None or self.start.size != n:
+            self.start = np.zeros(n, bool)
+        if learning:
+            self.start |= close
+        mask = self.start | (self._thin(r, close, bad) if self.use_thin else np.zeros(n, bool))
+        if self.dilate:
+            out = mask.copy()
+            for s in range(1, self.dilate + 1):
+                out |= np.roll(mask, s) | np.roll(mask, -s)
+            mask = out
+        self.mask = mask
+        return mask
+
+    def _thin(self, r, close, bad):
+        """Paquets de faisceaux à moins de near (mesurés, ou tenus/reportés par ScanFilter) dont au
+        plus `thin` sont de vraies mesures : un faisceau qui a vu le câble puis repasse à 0 reste
+        « proche » 0,6 s (ScanFilter.hold) ; sans ça le paquet grossit et n'est plus « fin »."""
+        out = np.zeros(r.size, bool)
+        meas = close
+        close = r < self.near
+        if not close.any():
+            return out
+        n = r.size
+        i = 0
+        start = int(np.argmin(close)) if not close.all() else 0   # commencer hors d'un paquet
+        seen = 0
+        while seen < n:
+            k = (start + i) % n
+            if close[k]:
+                j = 0
+                while j < n and close[(k + j) % n]:
+                    j += 1
+                run = (k + np.arange(j)) % n
+                lo, hi = r[(k - 1) % n], r[(k + j) % n]
+                if (int(meas[run].sum()) <= self.thin and j <= self.max_blind
+                        and lo > r[run].max() + 0.10 and hi > r[run].max() + 0.10):
+                    out[run] = True
+                    for step, e in ((-1, k - 1), (1, k + j)):   # trous sans écho collés au paquet
+                        m = 0
+                        while m < self.max_blind and bad[e % n]:
+                            out[e % n] = True
+                            e += step
+                            m += 1
+                i += j
+                seen += j
+            else:
+                i += 1
+                seen += 1
+        return out
+
+
+def fill_masked(r, mask, fill=None):
+    """Remplace les faisceaux masqués : par `fill` (distances données par la carte, nan = inconnu)
+    quand elle sait, sinon par le plus proche des deux faisceaux valides qui encadrent le trou
+    (prudent : jamais « libre » à travers le câble)."""
+    if not mask.any():
+        return r
+    out = r.copy()
+    if fill is not None:
+        ok = mask & np.isfinite(fill)
+        out[ok] = fill[ok]
+        mask = mask & ~ok
+    if mask.all() or not mask.any():
+        return out
+    n = r.size
+    idx = np.flatnonzero(~mask)
+    for k in np.flatnonzero(mask):
+        p = idx[np.searchsorted(idx, k) - 1]              # valide précédent (tour complet)
+        q = idx[np.searchsorted(idx, k) % idx.size]       # valide suivant
+        out[k] = min(r[p], r[q])
+    return out
 
 
 def sector(ranges, angles, deg_from, deg_to):
@@ -133,6 +238,40 @@ def sector(ranges, angles, deg_from, deg_to):
 def sector_min(ranges, angles, deg_from, deg_to):
     s = sector(ranges, angles, deg_from, deg_to)
     return float(s.min()) if s.size else float('inf')
+
+
+def small_objects(ranges, angles, deg_from, deg_to, max_range, max_width=0.30, jump=0.06, min_pts=2):
+    """Petits objets isolés (le haut d'un autre robot : tête LiDAR / plateau, 5-30 cm de large) dont le
+    centre est dans le secteur et le point le plus proche à moins de max_range.
+    Groupes = faisceaux voisins dont la distance varie de moins de `jump` ; on les forme sur le tour
+    complet pour qu'un mur coupé par le bord du secteur reste un long groupe (écarté). Un mur ou un
+    panneau de bord de piste est plus large que max_width -> ignoré. -> liste de (distance, angle °, largeur)."""
+    order = np.argsort(angles)
+    r, a = ranges[order], angles[order]
+    ok = np.isfinite(r) & (r < 3.0)
+    out = []
+    n = r.size
+    i = 0
+    while i < n:
+        if not ok[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and ok[j + 1] and abs(r[j + 1] - r[j]) < jump:
+            j += 1
+        pts = slice(i, j + 1)
+        rmin = float(r[pts].min())
+        if j - i + 1 >= min_pts and rmin < max_range:
+            x0, y0 = r[i] * math.cos(a[i]), r[i] * math.sin(a[i])
+            x1, y1 = r[j] * math.cos(a[j]), r[j] * math.sin(a[j])
+            width = math.hypot(x1 - x0, y1 - y0)
+            mid = math.degrees(math.atan2(math.sin(a[i]) + math.sin(a[j]), math.cos(a[i]) + math.cos(a[j])))
+            lo, hi = deg_from, deg_to
+            inside = lo <= mid <= hi if lo <= hi else (mid >= lo or mid <= hi)
+            if width <= max_width and inside:
+                out.append((rmin, mid, width))
+        i = j + 1
+    return out
 
 
 def count_below(ranges, angles, deg_from, deg_to, dist):

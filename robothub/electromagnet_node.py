@@ -1,7 +1,7 @@
 """Électroaimant Grove — À LANCER SUR LE RASPBERRY PI DU ROBOT.
 
-Écoute /electromagnet (std_msgs/Bool) et pilote la broche SIG du module Grove
-(numérotation BCM, par défaut GPIO18). Coupure automatique après `max_on_time`
+Écoute /electromagnet/cmd (std_msgs/Bool) et pilote la broche SIG du module Grove
+(numérotation BCM, par défaut GPIO17, comme le nœud de l'équipe). Coupure automatique après `max_on_time`
 secondes pour ne pas faire chauffer la bobine.
 
 Aucune bibliothèque GPIO à installer : sans gpiozero, la broche est pilotée directement par
@@ -65,7 +65,7 @@ def open_pin(pin):
 class Electromagnet(Node):
     def __init__(self):
         super().__init__('electromagnet')
-        pin = self.declare_parameter('gpio_pin', 18).value
+        pin = self.declare_parameter('gpio_pin', 17).value
         self.max_on = self.declare_parameter('max_on_time', 60.0).value
         try:
             self.dev, how = open_pin(pin)
@@ -74,7 +74,7 @@ class Electromagnet(Node):
             self.get_logger().warn(f'GPIO indisponible ({e}) -> mode simulation')
             self.dev = _DryPin()
         self.on_since = None
-        self.create_subscription(Bool, '/electromagnet', self.on_cmd, 10)
+        self.create_subscription(Bool, '/electromagnet/cmd', self.on_cmd, 10)
         self.create_timer(0.5, self.safety)
 
     def now(self):

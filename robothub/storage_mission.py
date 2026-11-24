@@ -135,7 +135,7 @@ class StorageMission(Node):
     def __init__(self):
         super().__init__('storage_mission')
         dp = lambda n, v: self.declare_parameter(n, v).value  # noqa: E731
-        side = dp('zones_side', 'left')
+        side = dp('zones_side', 'right')
         self.face_offset = math.pi / 2 if side == 'left' else -math.pi / 2
         self.n_zones = dp('n_zones', 3)
         self.first_zone = dp('first_zone_dist', 0.20)   # m le long de l'allée jusqu'à la 1re zone
@@ -188,7 +188,7 @@ class StorageMission(Node):
             self.get_logger().warn(f'modèles manquants dans {templates} : {missing}')
 
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.magnet_pub = self.create_publisher(Bool, dp('magnet_topic', '/electromagnet'), 10)
+        self.magnet_pub = self.create_publisher(Bool, dp('magnet_topic', '/electromagnet/cmd'), 10)
         subscribe_camera(self, self.on_image)
         self.create_subscription(LaserScan, '/scan', self.on_scan, qos_profile_sensor_data)
         self.create_subscription(Odometry, '/odom', self.on_odom, 10)

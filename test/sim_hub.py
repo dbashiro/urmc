@@ -30,11 +30,11 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PKG = HERE.parent
 WS = PKG.parent.parent
-CONFIG = PKG / 'config' / 'robothub.yaml'
+CONFIG = Path(os.environ['SIM_CONFIG']) if os.environ.get('SIM_CONFIG') else PKG / 'config' / 'robothub.yaml'
 TEMPLATES = Path('/tmp/robothub_sim_templates')
 RESULTS = HERE / 'results'
 LEVELS = ['ideal', 'real', 'hard']
-TIMEOUT = 200  # s réels par essai, au-delà : tué
+TIMEOUT = max(200, float(os.environ.get('ROBOTHUB_SIM_TMAX', 0)) + 80)  # s réels par essai, au-delà : tué
 
 
 @dataclass
@@ -56,29 +56,49 @@ SCENARIOS = [
              'fake_track_sim.py curve --sign left', 'piste'),
     Scenario('piste-virage-stop-milieu', 'Piste : virage + STOP au milieu (arrêt définitif)', TRACK,
              'fake_track_sim.py curve --sign center', 'piste'),
+    Scenario('piste-zigzag', 'Piste : 3 virages à angle droit en zigzag (rayon int. 12,5 cm) + damier', TRACK,
+             'fake_track_sim.py zigzag', 'piste'),
     Scenario('piste-aleatoire', 'Piste : tracé aléatoire (S) + damier', TRACK, 'fake_track_sim.py random', 'piste'),
     Scenario('barriere', 'Barrière : arrêt puis reprise', TRACK, 'fake_track_sim.py straight --barrier', 'piste'),
     Scenario('carrefour', 'Carrefour fig. 3 : tout droit', TRACK, 'fake_track_sim.py cross', 'piste'),
     Scenario('carrefour-priorite', 'Carrefour fig. 3 + robot 2 à droite', TRACK,
              'fake_track_sim.py cross --robot-right', 'piste'),
+    Scenario('carrefour-priorite-arret', 'Carrefour + robot 2 immobile à droite 6 s puis traverse', TRACK,
+             'fake_track_sim.py cross --robot-right --robot-wait 6', 'piste'),
     Scenario('parcours', 'Parcours : barrière + carrefour + virage + STOP (3 s) + damier', TRACK,
              'fake_track_sim.py parcours', 'piste'),
     Scenario('parcours-priorite', 'Parcours + robot 2 à droite au carrefour', TRACK,
              'fake_track_sim.py parcours --robot-right', 'piste'),
     Scenario('enclos-fixe', 'Enclos : figure 4 du règlement',
-             f'ros2 run robothub enclosure_mission --ros-args --params-file {CONFIG}',
+             f'ros2 run robothub enclosure_mission --ros-args --params-file {CONFIG} -p detect_entrance_sign:=false',
              'fake_enclosure_sim.py --layout fixed', 'enclos'),
     Scenario('enclos-aleatoire', 'Enclos : forme et portes aléatoires',
-             f'ros2 run robothub enclosure_mission --ros-args --params-file {CONFIG}',
+             f'ros2 run robothub enclosure_mission --ros-args --params-file {CONFIG} -p detect_entrance_sign:=false',
              'fake_enclosure_sim.py --layout random', 'enclos'),
+    Scenario('enclos-concours', 'Épreuve 4 : entrée/sortie 25 cm, tout droit depuis la piste, 5-9 pylônes',
+             f'ros2 run robothub enclosure_mission --ros-args --params-file {CONFIG} -p detect_entrance_sign:=false',
+             'fake_enclosure_sim.py --concours', 'enclos'),
+    Scenario('enclos-boite', 'Épreuve 4, enclos mesuré (entrée collée au coin droit, sortie à gauche près du mur d’entrée), sans carte',
+             f'ros2 run robothub enclosure_mission --ros-args --params-file {CONFIG} -p detect_entrance_sign:=false',
+             'fake_enclosure_sim.py --concours --boite', 'enclos'),
+    Scenario('enclos-boite-carte', 'Épreuve 4, enclos mesuré + carte des cotes (maps/concours.npz)',
+             f'ros2 run robothub enclosure_mission --ros-args --params-file {CONFIG} -p detect_entrance_sign:=false '
+             f'-p map_file:={PKG}/maps/concours.npz',
+             'fake_enclosure_sim.py --concours --boite', 'enclos'),
+    Scenario('enclos-concours-cable', 'Épreuve 4 + câble ethernet au-dessus du LiDAR',
+             f'ros2 run robothub enclosure_mission --ros-args --params-file {CONFIG} -p detect_entrance_sign:=false',
+             'fake_enclosure_sim.py --concours --cable', 'enclos'),
     Scenario('enclos-puis-piste', 'Enclos (LiDAR) puis suivi de ligne jusqu\'au damier',
-             f'ros2 run robothub enclosure_mission --ros-args --params-file {CONFIG} -p handoff:=true -p exit_extra:=0.05 & '
+             f'ros2 run robothub enclosure_mission --ros-args --params-file {CONFIG} -p detect_entrance_sign:=false -p handoff:=true -p exit_extra:=0.05 & '
              f'ros2 run robothub track_mission --ros-args --params-file {CONFIG} -p barrier:=false -p priority:=false -p stop_on_stop_sign:=false '
              f'-p start_topic:=/robothub/enclosure_done -p start_delay:=0.3 & wait',
              'fake_enclosure_sim.py --layout fixed --track', 'enclos'),
+    Scenario('arene', 'Défi collectif : arène 1,25 x 1 m avec 3 adversaires (60 s sans contact)',
+             'ros2 run robothub arena_mission --ros-args -p log:=none', 'fake_arena_sim.py', 'arene'),
     Scenario('stockage', 'Stockage : palette ① -> ②',
              f'ros2 run robothub storage_mission --ros-args --params-file {CONFIG} '
-             f'-p templates_dir:={TEMPLATES} -p sign_dist:=0.55',
+             f'-p templates_dir:={TEMPLATES} -p sign_dist:=0.55 -p zones_side:=left '   # géométrie de la simu : zones à gauche,
+             f'-p approach_dist:=0.20 -p first_zone_dist:=0.20 -p zone_spacing:=0.30',   # palette à 20 cm de l'allée
              'fake_storage_sim.py', 'stockage'),
 ]
 BY_NAME = {s.name: s for s in SCENARIOS}

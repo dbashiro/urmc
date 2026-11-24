@@ -31,6 +31,7 @@ setup(
             'capture_templates = robothub.capture_templates:main',
             'camera_web = robothub.camera_web:main',
             'control_panel = robothub.control_panel:main',
+            'arena_mission = robothub.arena_mission:main',
         ],
     },
 )

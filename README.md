@@ -146,8 +146,8 @@ carré), il avance au cap de la route (odométrie) jusqu'à retrouver les bandes
    l'image à chaque zone et corrige un départ trop près / trop loin des zones avant d'aller à la
    palette. Les modèles doivent alors être capturés robot bien dans l'axe. À 0.0 la correction est
    coupée. `aim_sign: false` coupe toute la visée des panneaux (retour à l'odométrie seule).
-7. **Électroaimant** : câblage sur le GPIO18 du Pi (`gpio_pin`), tester
-   `ros2 topic pub --once /electromagnet std_msgs/msg/Bool "{data: true}"`.
+7. **Électroaimant** : GPIO17 du Pi ; `robot.sh` lance le nœud de l'équipe (`~/TPE_2026_Electromagnet_control/magnet_node.py` sur le robot), tester
+   `ros2 topic pub --once /electromagnet/cmd std_msgs/msg/Bool "{data: true}"`.
 8. **Enclos** : `entrance_goal_deg` = direction de l'entrée par rapport au cap de départ.
 
 ## Tests sans robot

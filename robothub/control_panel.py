@@ -38,6 +38,7 @@ from robothub.camera_web import Source
 from robothub.vision import hsv_mask, resize_to_width
 
 DEFAULT_CONFIG = str(Path.home() / 'ros2_ws' / 'src' / 'robothub' / 'config' / 'robothub.yaml')
+MAPS_DIR = Path.home() / 'ros2_ws' / 'src' / 'robothub' / 'maps'   # cartes SLAM de l'onglet Carte (.npz)
 
 # ------------------------------------------------------------------ missions et réglages proposés
 # (clé YAML, libellé, min, max, pas)
@@ -47,12 +48,19 @@ TRACK_PARAMS = [
     ('kp', 'kp (braquage)', 0.0, 5.0, 0.1),
     ('kd', 'kd (amortissement)', 0.0, 5.0, 0.1),
     ('slow_k', 'Ralentir en virage (slow_k)', 0.0, 1.0, 0.05),
+    ('curve_k', 'Ralentir selon le braquage (curve_k)', 0.0, 1.0, 0.05),
     ('max_ang', 'Braquage max (rad/s)', 0.3, 2.8, 0.1),
     ('lane.center_offset', 'Décalage centre', -0.5, 0.5, 0.01),
     ('lane.lookahead', 'Regard au loin (lookahead)', 0.0, 1.0, 0.05),
     ('lane.roi_top', 'Haut de la zone utile (roi_top)', 0.2, 0.9, 0.05),
 ]
 MISSION_DEFAULTS = {'enclosure_follow': {'exit_extra': 0.05}}  # valeurs propres à une mission
+# 17/11 : mission 1 = course (race:=true) : ses propres réglages de virage (race_*), le reste partagé
+RACE_PARAMS = [p for p in TRACK_PARAMS if p[0] not in ('slow_k', 'curve_k')] + [
+    ('race_slow_k', 'Course : ralentir si décalé (race_slow_k)', 0.0, 1.0, 0.05),
+    ('race_curve_k', 'Course : ralentir selon le braquage (race_curve_k)', 0.0, 1.0, 0.05),
+    ('race_cut', 'Course : couper les virages (0 = rester au milieu)', 0.0, 0.6, 0.05),
+]
 INT_PARAMS = {'checker_count'}  # déclarés en entier dans les nœuds : ROS refuse 1.0 pour un entier
 
 
@@ -60,22 +68,33 @@ def _typed(spec, v):
     return int(round(float(v))) if spec[0] in INT_PARAMS else float(v)
 
 
-CODE_DEFAULTS = {'checker_count': 1, 'slow_k': 0.6, 'lane.lookahead': 0.35, 'speed': 0.10, 'cross_straight': 0.70,
+CODE_DEFAULTS = {'checker_count': 1, 'slow_k': 0.6, 'curve_k': 0.5, 'race_cut': 0.3, 'race_slow_k': 0.3,
+                 'race_curve_k': 0.2, 'lane.lookahead': 0.35, 'speed': 0.10, 'cross_straight': 0.70,
                  'cross_speed': 0.08}
 MISSIONS = {
-    'piste': dict(label='1 · Piste : suivi de ligne, virage, barrière, intersection, damier, STOP', exe='track_mission',
-                  node='track_mission',
-                  params=TRACK_PARAMS + [
+    'piste': dict(label='1 · Piste : suivi de ligne, virage, barrière, damier, STOP', exe='track_mission',
+                  node='track_mission', extra=['-p', 'priority:=false', '-p', 'race:=true'],   # pas d'intersection : épreuve 2
+                  params=RACE_PARAMS + [
+                      ('checker_rush_speed', 'Damier : vitesse de traversée (0 = s\'arrêter avant)', 0.0, 0.22, 0.01),
+                      ('checker_cross_dist', 'Damier : distance roulée après détection (m)', 0.0, 0.8, 0.01),
                       ('stop_sign_area', 'Panneau STOP : taille pour s\'arrêter', 0.002, 0.06, 0.001),
                       ('stop_sign_edge', 'Panneau STOP : s\'arrêter aussi s\'il sort de l\'image (marge, 0 = non)', 0.0, 0.3, 0.01),
                       ('checker_count', 'S\'arrêter au damier n° (0 = jamais)', 0, 5, 1),
                       ('checker_overrun', 'Damier : avance après l\'avoir vu (m)', 0.0, 0.4, 0.01),
-                      ('barrier_cam_bottom', 'Barrière : s\'arrêter à (bas image 0-1)', 0.1, 1.0, 0.05),
-                      ('priority_range', 'Intersection : distance détection robot (m)', 0.2, 1.5, 0.05),
-                      ('cross_straight', 'Intersection : traversée max tout droit (m)', 0.3, 1.2, 0.05),
-                      ('cross_speed', 'Intersection : vitesse de traversée (m/s)', 0.03, 0.15, 0.01)]),
+                      ('barrier_cam_bottom', 'Barrière : s\'arrêter à (bas image 0-1)', 0.1, 1.0, 0.05)]),
+    'intersection': dict(label='2 · Intersection : priorité à droite puis tout droit', exe='track_mission',
+                         node='track_mission',
+                         # épreuve 2 seule : ni barrière ni panneau STOP (damier gardé s'il y en a un)
+                         extra=['-p', 'priority:=true', '-p', 'barrier:=false', '-p', 'stop_on_stop_sign:=false'],
+                         params=TRACK_PARAMS + [
+                             ('priority_range', 'Robot à droite : distance de détection (m)', 0.2, 1.5, 0.05),
+                             ('priority_max_width', 'Robot à droite : largeur max vue au LiDAR (m)', 0.05, 0.6, 0.01),
+                             ('priority_max_wait', 'Robot à droite immobile : passer après (s, 0 = jamais)', 0.0, 60.0, 1.0),
+                             ('priority_clear_time', 'Voie libre depuis (s) avant de repartir', 0.3, 5.0, 0.1),
+                             ('cross_straight', 'Traversée max tout droit (m)', 0.3, 1.2, 0.05),
+                             ('cross_speed', 'Vitesse de traversée (m/s)', 0.03, 0.15, 0.01)]),
     'enclosure_follow': dict(
-        label='2 · Enclos (LiDAR) puis suivi de ligne', exe='enclosure_mission', node='enclosure_mission',
+        label='3 · Enclos (LiDAR) puis suivi de ligne', exe='enclosure_mission', node='enclosure_mission',
         # le suivi de ligne attend la sortie de l'enclos pour ouvrir la caméra
         extra=['-p', 'handoff:=true'],   # + exit_extra court : le suivi de ligne prend la main tout de suite
         also=[dict(exe='track_mission', node='track_mission',
@@ -89,7 +108,7 @@ MISSIONS = {
                 ('max_speed', 'Piste : vitesse max (m/s)', 0.02, 0.22, 0.01, 'track_mission'),
                 ('kp', 'Piste : kp', 0.0, 5.0, 0.1, 'track_mission'),
                 ('kd', 'Piste : kd', 0.0, 5.0, 0.1, 'track_mission')]),
-    'storage': dict(label='3 · Épreuve 5 : stockage palette (électroaimant)', exe='storage_mission', node='storage_mission',
+    'storage': dict(label='4 · Épreuve 5 : stockage palette (électroaimant)', exe='storage_mission', node='storage_mission',
                     params=[('speed', 'Vitesse (m/s)', 0.03, 0.22, 0.01),
                             ('approach_dist', 'Approche palette (m)', 0.05, 0.4, 0.01),
                             ('first_zone_dist', '1re zone (m)', 0.0, 1.0, 0.01),
@@ -192,11 +211,18 @@ class Panel(Node):
         self.create_subscription(CompressedImage, '/robothub/debug/compressed',
                                  lambda m: self.sources['debug'].push(bytes(m.data)), qos_profile_sensor_data)
         self.create_subscription(Odometry, '/odom', self.on_odom, 10)
-        self.create_subscription(LaserScan, '/scan', lambda m: self.seen.__setitem__('scan', time.time()),
-                                 qos_profile_sensor_data)
+        self.create_subscription(LaserScan, '/scan', self.on_scan, qos_profile_sensor_data)
         self.create_subscription(BatteryState, '/battery_state', self.on_battery, qos_profile_sensor_data)
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.kill_orphans()
         self.seen = {'odom': None, 'scan': None, 'battery': None}
+        # cartographie (onglet Carte) : SLAM pendant la conduite aux flèches
+        self.mapper = None          # GridSlam en cours de construction
+        self.map_ref = None         # pose odom au début de la carte (= origine du repère carte)
+        self.map_pose = None
+        self.odom_pose = None
+        self.odom_w = 0.0
+        self.map_lock = threading.Lock()
         self.battery = None
         self.speed = (0.0, 0.0)
         # mission
@@ -220,6 +246,93 @@ class Panel(Node):
     def on_odom(self, m):
         self.seen['odom'] = time.time()
         self.speed = (m.twist.twist.linear.x, m.twist.twist.angular.z)
+        from robothub.common import yaw_from_quat
+        p = m.pose.pose.position
+        self.odom_pose = (p.x, p.y, yaw_from_quat(m.pose.pose.orientation))
+        self.odom_w = m.twist.twist.angular.z
+
+    # --------------------------------------------------- cartographie (onglet Carte)
+    @staticmethod
+    def _rel(p0, p):
+        """Pose p exprimée dans le repère de la pose p0 (début de la carte = (0, 0, 0))."""
+        import math
+        c, s_ = math.cos(p0[2]), math.sin(p0[2])
+        dx, dy = p[0] - p0[0], p[1] - p0[1]
+        return (c * dx + s_ * dy, -s_ * dx + c * dy, math.atan2(math.sin(p[2] - p0[2]), math.cos(p[2] - p0[2])))
+
+    def on_scan(self, m):
+        self.seen['scan'] = time.time()
+        if self.mapper is None or self.odom_pose is None:
+            return
+        with self.map_lock:
+            if self.mapper is None:
+                return
+            if self.map_ref is None:
+                self.map_ref = self.odom_pose
+            rel = self._rel(self.map_ref, self.odom_pose)
+            r, a = self.map_filter(m, time.time(), rel[2])
+            try:
+                self.mapper.update(r, a, rel, abs(self.odom_w), m.range_max - 0.05)
+            except Exception as e:  # noqa: BLE001
+                self.get_logger().error(f'carte : {e!r}', throttle_duration_sec=2.0)
+            self.map_pose = self.mapper.apply(rel)
+
+    def map_start(self):
+        if self.running():
+            raise ValueError('mission en cours : STOP d\'abord')
+        from robothub import lidar
+        from robothub.enclosure_slam import GridSlam
+        with self.map_lock:
+            self.mapper = GridSlam(max_w=0.6)
+            self.map_ref = self.map_pose = None
+            self.map_filter = lidar.ScanFilter(fill_time=1.2)
+        self.add_log('● carte : démarrée. Conduis doucement (flèches) dans tout l\'enclos, jusqu\'à la sortie.')
+
+    def map_stop(self):
+        with self.map_lock:
+            sl, self.mapper = self.mapper, None
+        if sl is not None:
+            self.last_map = sl
+            self.add_log(f'■ carte : arrêtée ({sl.matched} scans recalés, {sl.rejected} refusés). Donne-lui un nom et enregistre.')
+
+    def map_save(self, name):
+        name = re.sub(r'[^\w-]+', '_', name.strip()) or time.strftime('carte_%H%M')
+        sl = self.mapper or getattr(self, 'last_map', None)
+        if sl is None or sl.origin is None:
+            raise ValueError('pas de carte à enregistrer : Démarrer puis rouler d\'abord')
+        MAPS_DIR.mkdir(parents=True, exist_ok=True)
+        path = MAPS_DIR / f'{name}.npz'
+        with self.map_lock:
+            sl.save(str(path), {'date': time.strftime('%Y-%m-%d %H:%M')})
+        self.add_log(f'✔ carte enregistrée : {path.name}')
+        return path.name
+
+    def map_list(self):
+        return sorted(p.stem for p in MAPS_DIR.glob('*.npz')) if MAPS_DIR.exists() else []
+
+    def map_image(self, name=None):
+        """Carte en PNG (base64) + passage pixel <-> carte. name None = carte en cours."""
+        import base64
+        from robothub.enclosure_slam import GridSlam, render
+        if name:
+            path = MAPS_DIR / f'{name}.npz'
+            if not path.exists():
+                raise ValueError(f'carte inconnue {name}')
+            sl, pose = GridSlam.load(str(path)), (0.0, 0.0, 0.0)
+        else:
+            with self.map_lock:
+                sl = self.mapper or getattr(self, 'last_map', None)
+                if sl is None:
+                    raise ValueError('aucune carte en cours')
+                sl.static = sl.split_static()
+                pose = self.map_pose
+                img, info = render(sl, pose, scale=3)
+            ok, png = cv2.imencode('.png', img)
+            return dict(png=base64.b64encode(png.tobytes()).decode(), info=info, mapping=self.mapper is not None,
+                        scans=sl.matched)
+        img, info = render(sl, pose, scale=3)
+        ok, png = cv2.imencode('.png', img)
+        return dict(png=base64.b64encode(png.tobytes()).decode(), info=info, mapping=False, scans=0)
 
     def on_battery(self, m):
         self.seen['battery'] = time.time()
@@ -237,12 +350,37 @@ class Panel(Node):
         self.roi_top = float(p.get('lane.roi_top', 0.55))
 
     # --------------------------------------------------- missions
+    def kill_orphans(self):
+        """17/11 : une mission lancée par un panneau précédent survit à son redémarrage (session à part) et
+        continuait d'envoyer vitesse 0 sur /cmd_vel -> robot lent, par à-coups. On ferme au démarrage les
+        missions restées sur NOTRE domaine ROS (les simus tournent sur les domaines 60-99 : pas touchées)."""
+        dom = os.environ.get('ROS_DOMAIN_ID', '0')
+        for pid in os.listdir('/proc'):
+            if not pid.isdigit() or int(pid) == os.getpid():
+                continue
+            try:
+                cmd = open(f'/proc/{pid}/cmdline', 'rb').read().split(b'\0')
+                env = dict(kv.split(b'=', 1) for kv in open(f'/proc/{pid}/environ', 'rb').read().split(b'\0')
+                           if b'=' in kv)
+            except OSError:
+                continue
+            exe = next((c.decode() for c in cmd if b'lib/robothub/' in c), '')
+            if not exe.endswith('_mission') or env.get(b'ROS_DOMAIN_ID', b'0').decode() != dom:
+                continue
+            self.get_logger().warn(f'mission orpheline fermée : {exe.rsplit("/", 1)[-1]} (pid {pid})')
+            try:
+                os.kill(int(pid), signal.SIGINT)
+            except OSError:
+                pass
+
     def add_log(self, line):
         with self.lock:
             self.log.append((self.log_seq, line))
             self.log_seq += 1
 
-    def start(self, name, params):
+    def start(self, name, params, slam=None):
+        if self.mapper is not None:
+            self.map_stop()
         if name not in MISSIONS:
             raise ValueError(f'mission inconnue {name}')
         if self.running():
@@ -257,6 +395,14 @@ class Panel(Node):
             for p in m['params']:  # chaque réglage va au nœud qui le concerne
                 if p[0] in params and (p[5] if len(p) > 5 else m['node']) == c['node']:
                     args += ['-p', f'{p[0]}:={_typed(p, params[p[0]])!r}']
+            if i == 0 and slam and slam.get('map') and c['exe'] == 'enclosure_mission':
+                path = MAPS_DIR / f'{slam["map"]}.npz'
+                if not path.exists():
+                    raise ValueError(f'carte inconnue {slam["map"]}')
+                args += ['-p', f'map_file:={path}']
+                pts = ';'.join(f'{x:.3f},{y:.3f}' for x, y in slam.get('points', []))
+                if pts:
+                    args += ['-p', f"waypoints:='{pts}'"]
             self.add_log(f'$ {" ".join(args[2:])}')
             proc = self._spawn(args)
             if i == 0:
@@ -318,7 +464,8 @@ class Panel(Node):
     def set_teleop(self, v, w):
         if self.running():
             raise ValueError('mission en cours : STOP d\'abord')
-        self.teleop = (max(-0.15, min(0.15, v)), max(-1.5, min(1.5, w)))
+        wmax = 0.5 if self.mapper is not None else 1.5   # carte en cours : on tourne doucement (scans nets)
+        self.teleop = (max(-0.15, min(0.15, v)), max(-wmax, min(wmax, w)))
         self.teleop_t = time.time()
         self.teleop_active = True
 
@@ -442,6 +589,13 @@ def make_handler(node):
                 return self.json(node.state(int(q.get('since', 0))))
             if u.path == '/api/missions':
                 return self.json(node.missions_info())
+            if u.path == '/api/maps':
+                return self.json({'maps': node.map_list(), 'mapping': node.mapper is not None})
+            if u.path == '/api/map':
+                try:
+                    return self.json(node.map_image(q.get('name') or None))
+                except Exception as e:  # noqa: BLE001
+                    return self.json({'error': str(e)}, 400)
             if u.path == '/api/hsv':
                 node.reload_hsv()
                 return self.json(node.hsv)
@@ -464,7 +618,13 @@ def make_handler(node):
             try:
                 b = self.body()
                 if u.path == '/api/start':
-                    node.start(b['mission'], b.get('params', {}))
+                    node.start(b['mission'], b.get('params', {}), b.get('slam'))
+                elif u.path == '/api/map/start':
+                    node.map_start()
+                elif u.path == '/api/map/stop':
+                    node.map_stop()
+                elif u.path == '/api/map/save':
+                    return self.json({'ok': True, 'name': node.map_save(b.get('name', ''))})
                 elif u.path == '/api/stop':
                     node.stop()
                 elif u.path == '/api/teleop':
@@ -604,6 +764,8 @@ input[type=range]{width:100%;accent-color:var(--acc)}
 .pad button{height:46px;font-size:18px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--fg);cursor:pointer;touch-action:none}
 .pad button:active,.pad button.on{background:var(--acc)}
 .hint{color:var(--dim);font-size:12px} .status{font-weight:600}
+.mapc{display:block;width:100%;image-rendering:pixelated;background:#090b0e;border:1px solid var(--line);border-radius:8px;margin-top:8px}
+#wpCanvas{cursor:crosshair} input[type=text]{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 6px;width:120px}
 </style></head><body>
 <header>
  <h1>RobotHub</h1>
@@ -672,6 +834,13 @@ input[type=range]{width:100%;accent-color:var(--acc)}
     <div class="params" id="params"></div>
     <button class="btn ghost sm" id="saveParams">Enregistrer ces réglages dans le YAML</button>
    </details>
+   <div id="slamOpts" hidden>
+    <div class="row"><label>Carte SLAM <select id="mapSel"></select></label>
+     <label>Objectif <select id="mapGoal"><option value="auto">sortie automatique</option><option value="points">mes points, puis la sortie</option></select></label></div>
+    <div id="wpBox" hidden><div class="row"><span class="hint">Clique sur la carte pour ajouter des points (dans l'ordre). Départ = point vert.</span>
+     <button class="btn ghost sm" id="wpUndo">↶</button><button class="btn ghost sm" id="wpClear">Effacer</button></div>
+     <canvas id="wpCanvas" class="mapc"></canvas></div>
+   </div>
    <div class="row">
     <button class="btn go" id="start">▶ Lancer</button>
     <span class="status" id="mstatus"></span>
@@ -681,6 +850,13 @@ input[type=range]{width:100%;accent-color:var(--acc)}
   <section class="card">
    <h2>Logs <span class="sp"></span><button class="btn ghost sm" id="logClear">Effacer</button></h2>
    <pre id="log"></pre>
+  </section>
+  <section class="card">
+   <h2>Carte (SLAM) <span class="sp"></span><span class="hint" id="mapMsg"></span></h2>
+   <div class="hint">1. Pose le robot <b>là où partira la mission</b> (devant l'entrée). 2. <b>Démarrer</b>. 3. Conduis-le aux flèches, doucement, partout dans l'enclos et jusqu'à la sortie. 4. <b>Arrêter</b>, nomme la carte, <b>Enregistrer</b>. Au lancement de la mission enclos, choisis-la dans « Carte SLAM ».</div>
+   <div class="row"><button class="btn" id="mapStart">● Démarrer</button><button class="btn ghost" id="mapStop">■ Arrêter</button>
+    <input type="text" id="mapName" placeholder="nom de la carte"><button class="btn ghost" id="mapSave">Enregistrer</button></div>
+   <canvas id="mapCanvas" class="mapc" hidden></canvas>
   </section>
   <section class="card">
    <h2>Pilotage manuel</h2>
@@ -779,10 +955,12 @@ function buildParams(){const cur=$('mission').value,m=missions[cur];const box=$(
   for(const p of m.params){const lab=document.createElement('label');lab.textContent=p.label;
     const r=document.createElement('input');r.type='range';r.min=p.min;r.max=p.max;r.step=p.step;
     const n=document.createElement('input');n.type='number';n.min=p.min;n.max=p.max;n.step=p.step;n.dataset.k=p.key;
-    n.value=r.value=(saved[p.key]??p.value);r.oninput=()=>{n.value=r.value;keep()};n.oninput=()=>{r.value=n.value;keep()};
+    // valeur retouchée gardée seulement si le YAML n'a pas changé depuis (sinon le YAML gagne)
+    const sv=saved[p.key];n.value=r.value=(Array.isArray(sv)&&sv[1]===p.value)?sv[0]:p.value;r.oninput=()=>{n.value=r.value;keep()};n.oninput=()=>{r.value=n.value;keep()};
     box.append(lab,r,n)}
-  store.set('mission',cur)}
-function keep(){store.set('params_'+$('mission').value,paramValues())}
+  store.set('mission',cur);showSlam()}
+function keep(){const m=missions[$('mission').value],v=paramValues(),o={};
+  for(const p of m.params)o[p.key]=[v[p.key],p.value];store.set('params_'+$('mission').value,o)}
 async function loadMissions(){missions=await api('/api/missions');const sel=$('mission'),box=$('mbtns');sel.innerHTML='';box.innerHTML='';
   for(const [k,m] of Object.entries(missions)){const o=document.createElement('option');o.value=k;o.textContent=m.label;sel.appendChild(o);
     const b=document.createElement('button');b.dataset.m=k;const i=m.label.indexOf(' : ');
@@ -790,13 +968,49 @@ async function loadMissions(){missions=await api('/api/missions');const sel=$('m
     if(i>=0){const s=document.createElement('small');s.textContent=m.label.slice(i+3);b.appendChild(s)}
     b.onclick=()=>{if(running)return;sel.value=k;buildParams()};box.appendChild(b)}
   sel.value=store.get('mission','piste');if(!missions[sel.value])sel.value=Object.keys(missions)[0];buildParams()}
-$('start').onclick=async()=>{try{await api('/api/start',{mission:$('mission').value,params:paramValues()});
+$('start').onclick=async()=>{try{const sl=slamChoice();await api('/api/start',{mission:$('mission').value,params:paramValues(),slam:sl});
   if(src==='camera')setSrc('auto')}catch(e){alert(e.message)}};
 $('stop').onclick=$('hstop').onclick=$('fsStop').onclick=stopAll;
 $('saveParams').onclick=async()=>{try{await api('/api/params/save',{mission:$('mission').value,params:paramValues()});
   store.set('params_'+$('mission').value,{});await loadMissions()}catch(e){alert(e.message)}};
 $('pdet').open=store.get('pdet',false);$('pdet').ontoggle=()=>store.set('pdet',$('pdet').open);
 $('logClear').onclick=()=>{$('log').textContent=''};
+
+// ---------- carte SLAM
+const SLAM_MISSIONS=['enclosure_follow'];let wp=[],wpMap=null,mapTimer=null;
+function slamChoice(){if(!SLAM_MISSIONS.includes($('mission').value)||!$('mapSel').value)return null;
+  return{map:$('mapSel').value,points:$('mapGoal').value==='points'?wp:[]}}
+function showSlam(){const on=SLAM_MISSIONS.includes($('mission').value);$('slamOpts').hidden=!on;if(on)refreshMaps()}
+async function refreshMaps(){try{const r=await api('/api/maps');const sel=$('mapSel'),cur=sel.value||store.get('mapSel','');sel.innerHTML='';
+  const o=document.createElement('option');o.value='';o.textContent='aucune (pas de SLAM préalable)';sel.appendChild(o);
+  for(const m of r.maps){const e=document.createElement('option');e.value=m;e.textContent=m;sel.appendChild(e)}
+  sel.value=r.maps.includes(cur)?cur:'';wpUpdate()}catch(e){}}
+// carte -> canvas ; info : x = x_min + px*m_per_px, y = y_max - py*m_per_px
+function drawMap(cv,d,pts){const im=new Image();im.onload=()=>{cv.width=d.info.w;cv.height=d.info.h;const g=cv.getContext('2d');g.drawImage(im,0,0);
+  const P=q=>[(q[0]-d.info.x_min)/d.info.m_per_px,(d.info.y_max-q[1])/d.info.m_per_px];
+  if(pts&&pts.length){g.strokeStyle='#ffd166';g.lineWidth=1;g.beginPath();g.moveTo(...P([0,0]));for(const q of pts)g.lineTo(...P(q));g.stroke();
+   pts.forEach((q,i)=>{const[x,y]=P(q);g.fillStyle='#ffd166';g.beginPath();g.arc(x,y,5,0,7);g.fill();g.fillStyle='#000';g.font='bold 9px sans-serif';g.fillText(i+1,x-3,y+3)})}};
+  im.src='data:image/png;base64,'+d.png}
+async function wpUpdate(){const name=$('mapSel').value;store.set('mapSel',name);$('wpBox').hidden=!name||$('mapGoal').value!=='points';
+  if(!name){wpMap=null;return}
+  if(!wpMap||wpMap.name!==name){try{wpMap=await api('/api/map?name='+encodeURIComponent(name));wpMap.name=name;wp=store.get('wp_'+name,[])}catch(e){wpMap=null;return}}
+  drawMap($('wpCanvas'),wpMap,wp)}
+$('mapSel').onchange=wpUpdate;$('mapGoal').onchange=()=>{store.set('mapGoal',$('mapGoal').value);wpUpdate()};
+$('mapGoal').value=store.get('mapGoal','auto');
+$('wpCanvas').onclick=e=>{if(!wpMap)return;const c=$('wpCanvas'),r=c.getBoundingClientRect();
+  const px=(e.clientX-r.left)*c.width/r.width,py=(e.clientY-r.top)*c.height/r.height;
+  wp.push([+(wpMap.info.x_min+px*wpMap.info.m_per_px).toFixed(3),+(wpMap.info.y_max-py*wpMap.info.m_per_px).toFixed(3)]);
+  store.set('wp_'+wpMap.name,wp);drawMap(c,wpMap,wp)};
+$('wpUndo').onclick=()=>{wp.pop();if(wpMap){store.set('wp_'+wpMap.name,wp);drawMap($('wpCanvas'),wpMap,wp)}};
+$('wpClear').onclick=()=>{wp=[];if(wpMap){store.set('wp_'+wpMap.name,wp);drawMap($('wpCanvas'),wpMap,wp)}};
+async function liveMap(){try{const d=await api('/api/map');$('mapCanvas').hidden=false;drawMap($('mapCanvas'),d,null);
+  $('mapMsg').textContent=d.mapping?`● carte en cours · ${d.scans} scans recalés`:'carte arrêtée (pas encore enregistrée ?)';
+  if(!d.mapping){clearInterval(mapTimer);mapTimer=null}}catch(e){$('mapMsg').textContent=e.message}}
+$('mapStart').onclick=async()=>{try{await api('/api/map/start',{});if(!mapTimer)mapTimer=setInterval(liveMap,700);liveMap()}catch(e){alert(e.message)}};
+$('mapStop').onclick=async()=>{await api('/api/map/stop',{}).catch(()=>{});liveMap()};
+$('mapSave').onclick=async()=>{try{const r=await api('/api/map/save',{name:$('mapName').value});$('mapMsg').textContent='✔ enregistrée : '+r.name;
+  store.set('mapSel',r.name);await refreshMaps()}catch(e){alert(e.message)}};
+api('/api/maps').then(r=>{if(r.mapping&&!mapTimer)mapTimer=setInterval(liveMap,700)}).catch(()=>{});
 
 // ---------- téléop
 const KEYS={up:[1,0],down:[-1,0],left:[0,1],right:[0,-1]};const held=new Set();let teleTimer=null;

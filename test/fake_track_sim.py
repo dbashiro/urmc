@@ -175,7 +175,45 @@ def parcours_centerline():
     return np.array(pts), (x1 + R, cy + R + 0.5 + SIGN_BACK, math.pi / 2)
 
 
+ZIG_R_IN = 0.125     # 17/11 : rayon intérieur des virages du zigzag de la vraie piste
+ZIG_GAP = float(os.environ.get('ROBOTHUB_SIM_ZIG_GAP', 0.20))   # m de ligne droite entre deux virages (inconnu)
+
+
+def zigzag_centerline():
+    """17/11 : vraie piste, 3 virages à angle droit enchaînés en zigzag (gauche, droite, gauche), rayon
+    intérieur 12,5 cm -> axe de la voie à 12,5 + 10 cm."""
+    R = ZIG_R_IN + TRACK_W / 2
+    pts = []
+    x, y, yaw = 0.3, 1.0, 0.0
+
+    def straight(L):
+        nonlocal x, y
+        for s in np.arange(0, L, 0.01):
+            pts.append((x + s * math.cos(yaw), y + s * math.sin(yaw)))
+        x, y = x + L * math.cos(yaw), y + L * math.sin(yaw)
+
+    def turn(sign):
+        nonlocal x, y, yaw
+        cx, cy = x - sign * R * math.sin(yaw), y + sign * R * math.cos(yaw)
+        for a in np.arange(0, math.pi / 2, 0.01 / R):
+            h = yaw + sign * a
+            pts.append((cx + sign * R * math.sin(h), cy - sign * R * math.cos(h)))
+        yaw += sign * math.pi / 2
+        x, y = cx + sign * R * math.sin(yaw), cy - sign * R * math.cos(yaw)
+
+    straight(0.6)
+    for k, sign in enumerate((1, -1, 1)):
+        turn(sign)
+        if k < 2:
+            straight(ZIG_GAP)
+    straight(0.6)
+    pts.append((x, y))
+    return np.array(pts), (x, y, yaw)
+
+
 def centerline(kind, seed=0):
+    if kind == 'zigzag':
+        return zigzag_centerline()
     if kind == 'random':
         return random_centerline(seed)
     if kind == 'parcours':
@@ -314,6 +352,11 @@ class Sim(Node):
         self.other_end = CROSS_C[1] + 1.2 if kind in ('cross', 'parcours') else 2.0
         self.other_go = False
         self.stopped_for_other = False
+        # --robot-wait S : le robot 2 reste immobile à droite S s après notre départ, puis traverse
+        self.other_wait = float(sys.argv[sys.argv.index('--robot-wait') + 1]) if '--robot-wait' in sys.argv else 0.0
+        self.t_start = None
+        if self.other_wait > 0 and kind == 'cross':   # immobile : arrêté juste avant le carrefour, sur sa route
+            self.other = [CROSS_C[0], CROSS_C[1] - 0.40]
         self.barrier_stopped = None
         if kind in ('curve', 'parcours'):
             # carton de 7 cm posé au sol sur le côté de la piste (juste derrière la bande), SIGN_BACK - 10 cm
@@ -454,7 +497,9 @@ class Sim(Node):
         if self.other is None:
             return
         start = self.barrier_open if self.kind == 'parcours' else self.moved
-        if not self.other_go and start:  # départ simultané : arrivée ensemble à l'intersection
+        if start and self.t_start is None:
+            self.t_start = self.t
+        if not self.other_go and start and self.t - self.t_start >= self.other_wait:  # départ simultané : arrivée ensemble à l'intersection
             self.other_go = True
         if self.other_go and self.other[1] < self.other_end:
             self.other[1] += 0.08 * dt
@@ -618,13 +663,13 @@ class Sim(Node):
         m.angle_min, m.angle_increment, m.angle_max = 0.0, math.radians(1.0), math.radians(359)
         m.range_min, m.range_max = 0.12, 3.5
         rs = [math.inf] * 360
-        if self.other is not None:  # 2e robot = disque de 9 cm
+        if self.other is not None:  # 2e robot : notre LiDAR ne voit que son haut (tête LiDAR, rayon 4 cm)
             ox, oy = self.other[0] - self.x, self.other[1] - self.y
             d = math.hypot(ox, oy)
             for i in range(360):
                 a = self.yaw + math.radians(i)
                 b = ox * math.cos(a) + oy * math.sin(a)
-                disc = b * b - (d * d - 0.09 ** 2)
+                disc = b * b - (d * d - 0.04 ** 2)
                 if disc >= 0 and b - math.sqrt(disc) > 0:
                     rs[i] = b - math.sqrt(disc)
         m.ranges = sim_core.lidar_effects(rs, self.level, self.rng)  # 0 sous range_min, bruit, pertes
@@ -638,7 +683,7 @@ class Sim(Node):
 
 def main():
     kind = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith('-') else 'straight'
-    if kind not in ('straight', 'curve', 'random', 'cross', 'parcours'):
+    if kind not in ('straight', 'curve', 'random', 'cross', 'parcours', 'zigzag'):
         raise SystemExit(f'piste inconnue {kind!r} : straight | curve | random | cross | parcours')
     if kind not in ('straight', 'cross', 'parcours') and '--robot-right' in sys.argv:
         raise SystemExit('--robot-right : uniquement avec les pistes straight et cross')

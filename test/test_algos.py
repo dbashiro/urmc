@@ -161,6 +161,27 @@ def test_sign_classifier(tmp_path):
     assert set(s) == {'zone1', 'zone2'} and s['zone2'][0] > s['zone1'][0] + 0.2
 
 
+CONCOURS_SIGNS = {'robot_2026-11-18-10-07-02.jpg': 'zone3', 'robot_2026-11-18-10-07-04.jpg': 'zone2',
+                  'robot_2026-11-18-10-07-07.jpg': 'zone1'}
+
+
+@pytest.mark.parametrize('zoom', [1.0, 0.8, 0.6, 0.5, 1.5])
+@pytest.mark.parametrize('name', sorted(CONCOURS_SIGNS))
+def test_sign_classifier_concours_photos(name, zoom):
+    """Vraies photos du terrain (18/11, panneaux bleus numérotés, ordre tiré au sort) avec les modèles
+    du dépôt ; zoom < 1 = panneau plus loin / plus petit (~15 px à 0.5), là où la corrélation seule se trompait."""
+    import os
+    here = os.path.dirname(__file__)
+    clf = vision.SignClassifier(os.path.join(here, '..', 'templates'))
+    img = cv2.imread(os.path.join(here, 'data', 'panneaux_concours', name))
+    h, w = img.shape[:2]
+    img = cv2.warpAffine(img, cv2.getRotationMatrix2D((w / 2, h / 2), 0, zoom), (w, h), borderMode=cv2.BORDER_REPLICATE)
+    s = clf.scores(img, ['zone1', 'zone2', 'zone3'], (0.25, 0.75))
+    best = max(s, key=lambda k: s[k][0])
+    second = max(v[0] for k, v in s.items() if k != best)
+    assert best == CONCOURS_SIGNS[name] and s[best][0] >= 0.6 and s[best][0] - second > 0.05
+
+
 def make_scan(points_fn, n=360, rmax=3.5):
     """Scan synthétique : points_fn(angle) -> distance."""
     ang = np.arange(n) * 2 * math.pi / n
@@ -478,3 +499,84 @@ def test_enclosure_slam_corrects_odometry_drift():
     assert drift > math.radians(25)              # l'odométrie seule est vraiment fausse
     assert worst[0] < 0.06 and worst[1] < math.radians(5), worst
     assert slam.matched > 100 and slam.rejected < 10
+
+
+# ------------------------------------------------------------------ défi collectif (arène)
+def _arena_scan(px, py, yaw, robots=(), L=1.25, W=1.0, lidar_back=0.032):
+    """scan idéal (360 faisceaux) depuis le LiDAR d'un robot dont l'essieu est en (px, py, yaw), monde [0,L]x[0,W]"""
+    ox, oy = px - lidar_back * math.cos(yaw), py - lidar_back * math.sin(yaw)
+    a = yaw + np.radians(np.arange(360))
+    dx, dy = np.cos(a), np.sin(a)
+    with np.errstate(divide='ignore'):
+        tx = np.where(dx > 1e-9, (L - ox) / dx, np.where(dx < -1e-9, -ox / dx, np.inf))
+        ty = np.where(dy > 1e-9, (W - oy) / dy, np.where(dy < -1e-9, -oy / dy, np.inf))
+    r = np.minimum(tx, ty)
+    for cx, cy in robots:
+        fx, fy = ox - cx, oy - cy
+        b = fx * dx + fy * dy
+        d = b * b - (fx * fx + fy * fy - 0.035 ** 2)
+        th = -b - np.sqrt(np.maximum(d, 0))
+        r = np.where((d >= 0) & (th > 0) & (th < r), th, r)
+    return r
+
+
+def _arena_brain(px, py, yaw, robots_fn, n=12, p=None):
+    from robothub import arena_core as ac
+    b = ac.ArenaBrain(p or ac.Params())
+    # odométrie = monde décalé : le repère odom part de la pose initiale (0, 0, 0)
+    c, s = math.cos(-yaw), math.sin(-yaw)
+    t = 0.0
+    for k in range(n):
+        t += 0.1
+        b.on_odom(t - 0.05, 0.0, 0.0, 0.0, 0.0, 0.0)
+        b.on_odom(t, 0.0, 0.0, 0.0, 0.0, 0.0)
+        if k % 2 == 1:
+            b.on_scan(t, _arena_scan(px, py, yaw, robots_fn(t)), 0.0, math.radians(1.0))
+    return b, t, (c, s)
+
+
+def test_arena_fit_finds_the_rectangle():
+    b, t, (c, s) = _arena_brain(0.40, 0.35, math.radians(25), lambda t: [(0.9, 0.7)])
+    a = b.per.arena
+    assert a.ok
+    # centre vrai (0.625, 0.5) dans le repère odom (origine = essieu au départ, axe x = cap de départ)
+    qx, qy = 0.625 - 0.40, 0.5 - 0.35
+    cx, cy = c * qx - s * qy, s * qx + c * qy
+    assert math.hypot(a.c[0] - cx, a.c[1] - cy) < 0.02
+    d = (a.phi - math.radians(-25) + math.pi / 2) % math.pi - math.pi / 2
+    assert abs(d) < math.radians(3)
+
+
+def test_arena_tracks_robot_velocity():
+    # adversaire qui traverse à 0,15 m/s (axe x du monde) ; notre robot immobile, cap 0
+    b, t, _ = _arena_brain(0.3, 0.3, 0.0, lambda t: [(0.5 + 0.15 * t, 0.7)], n=30)
+    P, V, U = b.per.obstacles(t)
+    assert len(P) == 1
+    assert abs(V[0][0] - 0.15) < 0.04 and abs(V[0][1]) < 0.04
+
+
+def test_arena_planner_refuses_wall_and_frontal_hit():
+    from robothub import arena_core as ac
+    p = ac.Params()
+    pl = ac.Planner(p)
+
+    class A:                         # arène exacte, centrée en (0, 0) dans le repère du test
+        phi, c, ok = 0.0, np.array([0.0, 0.0]), True
+
+        @staticmethod
+        def wall_dist(pts):
+            q = np.asarray(pts)
+            return np.minimum(p.length / 2 - np.abs(q[..., 0]), p.width / 2 - np.abs(q[..., 1]))
+
+        @staticmethod
+        def to_local(pts):
+            q = np.asarray(pts)
+            return q[..., 0], q[..., 1]
+    none = (np.zeros((0, 2)), np.zeros((0, 2)), np.zeros(0))
+    # face au mur droit (x = 0.625) à ~12 cm : ne pas continuer tout droit
+    v, w = pl.plan((0.625 - 0.16, 0.0, 0.0), (0.10, 0.0), A, none, np.zeros((0, 2)), (0.10, 0.0), 0.0, 0.6)
+    assert not (v > 0 and abs(w) < 0.3)
+    # robot qui arrive de face à 0,15 m/s, 35 cm devant : on ne fonce pas dessus
+    rob = (np.array([[0.35, 0.0]]), np.array([[-0.15, 0.0]]), np.array([0.02]))
+    v, w = pl.plan((0.0, 0.0, 0.0), (0.10, 0.0), A, rob, np.zeros((0, 2)), (0.10, 0.0), 0.0, 0.6)
+    assert abs(w) > 0.4 or v <= 0

@@ -111,7 +111,7 @@ class Sim(Node):
                                           ZONE_Y + PALLET_HALF, '#6b4a1e', '#d9b98a'))
         self.traj = sim_core.TrajLog((-0.25, -0.2, 1.3, 0.65), shapes)
         self.create_subscription(Twist, '/cmd_vel', self.on_cmd, 10)
-        self.create_subscription(Bool, '/electromagnet', self.on_magnet, 10)
+        self.create_subscription(Bool, '/electromagnet/cmd', self.on_magnet, 10)
         self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
         self.img_pub = self.create_publisher(CompressedImage, '/camera/image_raw/compressed',
                                              qos_profile_sensor_data)

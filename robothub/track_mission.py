@@ -39,6 +39,24 @@ class TrackMission(Node):
         self.max_speed = dp('max_speed', 0.12)        # m/s (max robot 0.22)
         self.min_speed = dp('min_speed', 0.05)
         self.slow_k = dp('slow_k', 0.6)               # ralentit quand l'erreur est grande
+        # 17/11 (3 virages enchaînés : le robot sortait en sortie de virage) : ralentit aussi selon le
+        # braquage demandé, donc dès l'entrée du virage, avant d'être décalé. 0 = non.
+        self.curve_k = dp('curve_k', 0.5)
+        # 17/11 (course) : couper les virages. La consigne est décalée vers l'intérieur du virage en
+        # proportion du braquage lissé (race_cut = décalage à braquage max, en fraction de la
+        # demi-image ; ~0.3 = roues sur la bande intérieure). Bandes peintes sur bois : on peut rouler
+        # dessus. 0 = rester au milieu.
+        self.race_cut = dp('race_cut', 0.3)
+        self.race_tau = dp('race_tau', 0.4)          # s : lissage du braquage utilisé pour le décalage
+        # race:=true (mission 1 du panneau) : réglages « course » à part, pour ne pas toucher les autres
+        # missions qui partagent cette section du YAML
+        self.race = dp('race', False)
+        race_slow, race_curve = dp('race_slow_k', 0.3), dp('race_curve_k', 0.2)
+        if self.race:
+            self.slow_k, self.curve_k = race_slow, race_curve
+        else:
+            self.race_cut = 0.0
+        self.ang_s = 0.0
         self.kp = dp('kp', 1.6)
         self.kd = dp('kd', 2.0)
         self.max_ang = dp('max_ang', 1.5)             # rad/s
@@ -59,12 +77,27 @@ class TrackMission(Node):
         self.stop_sign_wait = dp('stop_sign_wait', 3.0)
         self.stop_sign_side = dp('stop_sign_side', 0.15)
         self.stop_sign_clear = dp('stop_sign_clear', 0.5)  # m après être reparti sans regarder les panneaux
+        # 17/11 (concours) : déclenché « au bord de l'image », le panneau est encore loin (taille 0.004-0.006)
+        # -> on continue encore X m à l'odométrie avant de marquer l'arrêt. 0 = arrêt immédiat comme avant.
+        self.stop_sign_overrun = dp('stop_sign_overrun', 0.10)
+        self.stop_pending = None
         self.stop_ignore_until = 0.0
         self.stop_cmd_t = 0.0
         self.stop_t0 = None
         self.speed = 0.0
         # la caméra voit le damier avant que le robot n'y soit : on continue de X m (odométrie) pour s'arrêter dessus
         self.checker_overrun = dp('checker_overrun', 0.13)
+        # 17/11 (course) : damier vu -> on le traverse à checker_rush_speed (cap tenu) et on s'arrête
+        # checker_cross_dist m après l'avoir vu (juste après). checker_rush_speed 0 = ancien arrêt avant/dessus.
+        self.rush_speed = dp('checker_rush_speed', 0.22)
+        self.cross_dist = dp('checker_cross_dist', 0.30)
+        self.rush_yaw = None
+        # approche : dès que le damier, le panneau STOP ou la barrière sont aperçus (de loin), on roule
+        # à approach_speed pendant au moins approach_time s -> arrêt plus court et plus précis (moins de
+        # dépassement dû aux images de confirmation, au délai wifi et au freinage). 0 = désactivé.
+        self.approach_speed = dp('approach_speed', 0.08)
+        self.approach_time = dp('approach_time', 0.8)
+        self.approach_t = -1e9
         # barrière
         self.barrier_lidar_dist = dp('barrier_lidar_dist', 0.22)  # m devant le LiDAR ; <= 0 : désactivé
         self.barrier_lidar_deg = dp('barrier_lidar_deg', 12.0)
@@ -76,6 +109,17 @@ class TrackMission(Node):
         self.prio_min_points = dp('priority_min_points', 3)
         self.prio_clear_time = dp('priority_clear_time', 1.5)
         self.prio_after_m = dp('priority_after_m', 0.0)   # n'active la surveillance qu'après X m
+        # 17/11 : du robot 2, notre LiDAR ne voit que le haut (tête LiDAR / plateau) -> on cherche un PETIT
+        # objet isolé (<= priority_max_width m de large) : un mur ou un panneau de bord de piste est long.
+        self.prio_max_width = dp('priority_max_width', 0.30)
+        # robot 2 qui reste arrêté à droite : au bout de X s (et voie libre devant) on passe ; 0 = attendre
+        # tant qu'il est là
+        self.prio_max_wait = dp('priority_max_wait', 10.0)
+        self.prio_t0 = None
+        self.prio_xy = None
+        self.prio_still_t = 0.0
+        self.prio_skip_until = 0.0
+        self.prio_what = ''
         # carrefour (mission intersection) : au milieu il n'y a plus de bande à suivre. Quand les deux
         # bandes disparaissent, on avance de cross_pre m au cap de la route puis on tourne de 90°
         # (rayon cross_radius) du côté cross_turn, et on reprend le suivi. straight (demandé) :
@@ -101,7 +145,9 @@ class TrackMission(Node):
         # damier : s'arrêter au N-ième (les précédents sont franchis avec un bip) ; 0 = ne jamais s'arrêter
         self.checker_count = dp('checker_count', 1)
         self.checkers_seen = 0
-        self.checker_ignore_until = 0.0
+        # 17/11 (concours) : le cercle blanc de départ était pris pour le damier (OVERRUN 0,1 s après le
+        # départ) -> pas de damier sur les X premiers mètres
+        self.checker_ignore_until = dp('checker_after', 0.30)
         # priorité à droite seulement à l'approche d'un carrefour (bandes qui s'ouvrent vues depuis peu)
         # au lieu de tout le temps — indispensable sur un parcours complet (décor à droite)
         self.priority_gate = dp('priority_gate', True)
@@ -168,6 +214,7 @@ class TrackMission(Node):
         self.dist_checker = 0.0
         self.clear_since = None
         self.frame = 0
+        self.done_t = 0.0
         self.get_logger().info(f'Mission piste : damier={self.stop_on_checker} (n° {self.checker_count}) '
                                f'panneau STOP={self.stop_on_stop_sign} barrière={self.use_barrier} '
                                f'intersection={self.use_priority}')
@@ -217,7 +264,10 @@ class TrackMission(Node):
             cv2.imwrite(f'{self.dump_lost}/lost_{self.dumped:03d}_{self.state}_d{self.dist * 100:.0f}.png', img)
 
         if self.state == 'DONE':
-            self.drive(0.0, 0.0)
+            # 1 s de vitesse nulle puis plus rien : une mission finie mais pas fermée ne doit pas
+            # brider la suivante (17/11 : robot lent par à-coups à cause d'une mission fantôme)
+            if now - self.done_t < 1.0:
+                self.drive(0.0, 0.0)
         elif self.state == 'START':
             self.drive(0.0, 0.0)
             if now - self.t0 > self.start_delay:
@@ -238,19 +288,35 @@ class TrackMission(Node):
             self.counts['stop'] = 0
             self.set_state('FOLLOW', beep=True)
         # 1) fin de parcours
+        if self.state == 'RUSH':
+            if self.dist - self.dist_checker >= self.cross_dist:
+                return self.finish(f'damier traversé ({self.dist - self.dist_checker:.2f} m)')
+            ang = 0.0 if self.yaw is None or self.rush_yaw is None else clamp(2.5 * wrap(self.rush_yaw - self.yaw),
+                                                                               -self.max_ang, self.max_ang)
+            return self.drive(self.rush_speed, ang)
         if self.state == 'OVERRUN':
             # tout droit : les bandes s'arrêtent au damier, le suivi de piste n'a plus de repère
             if self.dist - self.dist_checker >= self.checker_overrun:
                 return self.finish('sur le damier')
-            return self.drive(max(self.min_speed, 0.6 * self.max_speed), 0.0)
-        elif (self.stop_on_checker and self.checker_count > 0 and self.dist >= self.checker_ignore_until
-              and self.confirm('checker', lane.checker)):
+            v = self.approach_speed if self.approach_speed > 0 else 0.6 * self.max_speed
+            return self.drive(max(self.min_speed, v), 0.0)
+        if (self.stop_on_checker and self.checker_count > 0 and self.dist >= self.checker_ignore_until
+                and lane.checker_ahead and self.rush_speed <= 0):   # course : pas de ralenti avant le damier
+            self.approach_t = now
+        if (self.stop_on_checker and self.checker_count > 0 and self.dist >= self.checker_ignore_until
+                and self.confirm('checker', lane.checker)):
             self.checkers_seen += 1
             if self.checkers_seen < self.checker_count:  # pas encore le bon : on le franchit
                 self.get_logger().info(f'damier {self.checkers_seen}/{self.checker_count} franchi')
                 self.beeper.beep(1)
                 self.checker_ignore_until = self.dist + 0.4
                 self.counts['checker'] = 0
+            elif self.rush_speed > 0:
+                self.dist_checker = self.dist
+                self.rush_yaw = self.yaw
+                self.get_logger().info(f'damier : traversée à {self.rush_speed:.2f} m/s sur {self.cross_dist:.2f} m')
+                self.set_state('RUSH', beep=True)
+                return self.drive(self.rush_speed, 0.0)
             elif self.checker_overrun <= 0:
                 return self.finish('damier détecté')
             else:
@@ -258,11 +324,22 @@ class TrackMission(Node):
                 self.set_state('OVERRUN', beep=True)
         barrier_bottom = vision.detect_barrier(img, self.barrier) if self.use_barrier else None
         self.barrier_bottom = barrier_bottom
+        if barrier_bottom is not None:
+            self.approach_t = now
         # une barrière rouge ressemblerait à un panneau : pas de panneau STOP tant qu'on la voit
         self.sign = None
-        if self.stop_on_stop_sign and barrier_bottom is None and self.dist >= self.stop_ignore_until:
+        if self.stop_pending is not None:
+            # panneau vu au bord de l'image : on roule encore stop_sign_overrun m (suivi de piste normal)
+            self.approach_t = now
+            if self.dist - self.stop_pending['d0'] >= self.stop_pending['extra']:
+                off, what = self.stop_pending['off'], self.stop_pending['what']
+                self.stop_pending = None
+                return self.stop_at_sign(off, what, now)
+        elif self.stop_on_stop_sign and barrier_bottom is None and self.dist >= self.stop_ignore_until:
             self.sign = vision.find_stop_sign(img, self.red)
             area = self.sign['area_frac'] if self.sign else 0.0
+            if area >= self.stop_sign_min_area:
+                self.approach_t = now
             leaving = self.sign_leaving(img)
             if self.confirm('stop', area >= self.stop_sign_area or leaving):
                 x, _, bw, _ = self.sign['rect']
@@ -270,12 +347,17 @@ class TrackMission(Node):
                 what = f'taille {area:.3f}, à {off:+.2f} du milieu de l\'image'
                 if area < self.stop_sign_area:
                     what += ', au bord de l\'image'
-                if self.stop_sign_wait <= 0 or abs(off) < self.stop_sign_side:
-                    return self.finish(f'panneau STOP au milieu de la piste ({what})')
-                self.get_logger().info(f'panneau STOP sur le côté ({what}) : arrêt de {self.stop_sign_wait:.0f} s')
-                self.stop_cmd_t, self.stop_t0 = now, None
-                self.set_state('STOPSIGN', beep=True)
-                return self.drive(0.0, 0.0)
+                    # cm restants : tout stop_sign_overrun si le panneau est encore petit (loin), rien
+                    # s'il a presque la taille d'arrêt (proche)
+                    span = max(1e-6, self.stop_sign_area - self.stop_sign_min_area)
+                    extra = self.stop_sign_overrun * min(1.0, max(0.0, (self.stop_sign_area - area) / span))
+                    if extra > 0.01:
+                        self.get_logger().info(f'panneau STOP vu ({what}) : encore '
+                                               f'{100 * extra:.0f} cm avant l\'arrêt')
+                        self.stop_pending = dict(d0=self.dist, off=off, what=what, extra=extra)
+                        self.counts['stop'] = 0
+                if self.stop_pending is None:
+                    return self.stop_at_sign(off, what, now)
 
         # 2) barrière : on attend qu'elle se lève
         if self.use_barrier and self.state != 'OVERRUN':
@@ -294,15 +376,24 @@ class TrackMission(Node):
             self.last_diverge_t = now
         near_cross = (not self.priority_gate or now - self.last_diverge_t < 2.5 or self.state == 'PRIORITY')
         if (self.use_priority and self.state not in ('OVERRUN', 'CROSS') and self.dist >= self.prio_after_m
-                and near_cross):
+                and self.dist >= self.prio_skip_until and near_cross):
             if self.fresh_scan() is None:  # sans LiDAR on ne sait pas si la voie est libre
                 self.get_logger().warn('LiDAR muet -> arrêt (priorité à droite)', throttle_duration_sec=1.0)
                 return self.drive(0.0, 0.0)
             right, front = self.robot_on_right()
             if self.state != 'PRIORITY' and right:
-                self.set_state('PRIORITY')
+                self.set_state('PRIORITY', beep=True)
+                self.prio_t0 = now
+                self.get_logger().info(f'robot à droite : {self.prio_what} -> on le laisse passer')
             if self.state == 'PRIORITY':
                 if self.cleared_for(not (right or front), now, self.prio_clear_time):
+                    self.get_logger().info('voie libre : on repart')
+                    self.set_state('FOLLOW')
+                elif (self.prio_max_wait > 0 and right and not front
+                      and now - max(self.prio_t0, self.prio_still_t) >= self.prio_max_wait):
+                    # il reste à droite sans bouger : on passe (devant toujours surveillé)
+                    self.get_logger().info(f'robot à droite immobile depuis {self.prio_max_wait:.0f} s : on passe')
+                    self.prio_skip_until = self.dist + 0.6
                     self.set_state('FOLLOW')
                 else:
                     return self.drive(0.0, 0.0)
@@ -351,9 +442,18 @@ class TrackMission(Node):
             else:
                 dt = clamp(now - self.prev_t, 0.02, 0.3)
                 deriv = (err - self.prev_err) * self.kd_period / dt
+            if self.race_cut > 0:
+                # virage à gauche (ang > 0) : robot voulu à gauche du milieu, donc piste vue à droite (err > 0)
+                err = err - self.race_cut * clamp(self.ang_s / self.max_ang, -1.0, 1.0)
             ang = -(self.kp * err + self.kd * deriv)
-            self.prev_err, self.prev_t = err, now
-            lin = max(self.min_speed, self.max_speed * (1 - self.slow_k * min(1.0, abs(err))))
+            if self.prev_t is not None:
+                k = clamp((now - self.prev_t) / max(self.race_tau, 1e-3), 0.0, 1.0)
+                self.ang_s += k * (clamp(ang, -self.max_ang, self.max_ang) - self.ang_s)
+            self.prev_err, self.prev_t = lane.error, now
+            lin = max(self.min_speed, self.max_speed * (1 - self.slow_k * min(1.0, abs(err)))
+                      * (1 - self.curve_k * min(1.0, abs(ang) / self.max_ang)))
+            if self.approach_speed > 0 and now - self.approach_t < self.approach_time:
+                lin = min(lin, max(self.min_speed, self.approach_speed))
             self.drive(lin, clamp(ang, -self.max_ang, self.max_ang))
         else:
             # plus de ligne (intersection, trou) : tout droit doucement, puis arrêt
@@ -464,7 +564,17 @@ class TrackMission(Node):
             return False, False
         r, a = scan
         lo, hi = self.prio_sector
-        right = lidar.count_below(r, a, lo, hi, self.prio_range) >= self.prio_min_points
+        objs = lidar.small_objects(r, a, lo, hi, self.prio_range, self.prio_max_width,
+                                   min_pts=self.prio_min_points)
+        right = bool(objs)
+        if objs:
+            d, ang, wd = min(objs)
+            self.prio_what = f'{100 * d:.0f} cm à {ang:+.0f}°, {100 * wd:.0f} cm de large'
+            # il bouge (> 3 cm depuis la dernière fois) : l'attente « immobile » repart de zéro
+            xy = (d * math.cos(math.radians(ang)), d * math.sin(math.radians(ang)))
+            if self.prio_xy is None or math.hypot(xy[0] - self.prio_xy[0], xy[1] - self.prio_xy[1]) > 0.03:
+                self.prio_xy = xy
+                self.prio_still_t = self.now()
         front = lidar.count_below(r, a, -25, 25, 0.45) >= self.prio_min_points
         return right, front
 
@@ -477,10 +587,20 @@ class TrackMission(Node):
             if beep:
                 self.beeper.beep(1)
 
+    def stop_at_sign(self, off, what, now):
+        """Panneau STOP atteint : au milieu de la piste = arrêt définitif ; sur le côté = arrêt de stop_sign_wait s."""
+        if self.stop_sign_wait <= 0 or abs(off) < self.stop_sign_side:
+            return self.finish(f'panneau STOP au milieu de la piste ({what})')
+        self.get_logger().info(f'panneau STOP sur le côté ({what}) : arrêt de {self.stop_sign_wait:.0f} s')
+        self.stop_cmd_t, self.stop_t0 = now, None
+        self.set_state('STOPSIGN', beep=True)
+        return self.drive(0.0, 0.0)
+
     def finish(self, why):
         self.drive(0.0, 0.0)
         self.get_logger().info(f'ARRIVÉE : {why}')
         self.beeper.beep(4)
+        self.done_t = self.now()
         self.set_state('DONE')
 
     def drive(self, lin, ang):

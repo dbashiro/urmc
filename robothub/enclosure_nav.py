@@ -253,8 +253,10 @@ class Planner:
     def cell(self, x, y):
         return int(round(y / self.res)) + self.c, int(round(x / self.res)) + self.c
 
-    def update(self, r, a, pts):
-        """Prépare la carte pour ce scan : distance au plus proche obstacle + zones vues."""
+    def update(self, r, a, pts, extra=None):
+        """Prépare la carte pour ce scan : distance au plus proche obstacle + zones vues.
+        extra : obstacles en plus (repère robot), pris tels quels sans les relier (cellules occupées de
+        la carte du SLAM : un pylône hors du scan du moment reste un obstacle)."""
         n = self.n
         obst = np.zeros((n, n), np.uint8)
         px = np.rint(pts / self.res).astype(np.int32) + self.c
@@ -265,6 +267,10 @@ class Planner:
         close = np.hypot(*(pts[nxt] - pts).T) < self.link_dist
         for i in np.flatnonzero(close & ok & ok[nxt]):
             cv2.line(obst, tuple(px[i].tolist()), tuple(px[nxt[i]].tolist()), 255, 1)
+        if extra is not None and len(extra):
+            pe = np.rint(extra / self.res).astype(np.int32) + self.c
+            oke = (pe >= 0).all(axis=1) & (pe < n).all(axis=1)
+            obst[pe[oke, 1], pe[oke, 0]] = 255
         self.clear = cv2.distanceTransform(255 - obst, cv2.DIST_L2, 5) * self.res
         # zone « vue » : plus près que l'écho du rayon (médiane sur 3 rayons : un faisceau perdu ne compte pas)
         rb = np.full(360, np.inf, np.float32)

@@ -4,39 +4,63 @@
 
 track_mission:
   ros__parameters:
+    priority_clear_time: 0.3
+    cross_speed: 0.08
+    cross_straight: 0.7
+    slow_k: 0.6
+    # 17/11 course (mission 1 du panneau, race:=true) : ralentit peu, coupe les virages (roues sur la bande
+    # intérieure). Simu : zigzag 15,0 s -> 13,0 s, mais sort de la piste au niveau « hard ». Plus prudent :
+    # race_cut 0.0 et race_slow_k / race_curve_k = slow_k / curve_k.
+    race_slow_k: 0.3
+    race_curve_k: 0.2
+    race_cut: 0.3
+    curve_k: 0.5                  # 17/11 : ralentit selon le braquage (dépassement dans les 3 virages enchaînés) ; 0 = non
     image_topic: /camera/image_raw/compressed
     compressed: true
-    max_speed: 0.12
-    min_speed: 0.05
-    kp: 1.6
+    max_speed: 0.22               # 17/11 : 0.12 trop lent (max robot 0.22)
+    start_delay: 0.3            # pause au départ avant de rouler (s) ; avant 1.0
+    min_speed: 0.01
+    approach_speed: 0.08        # 17/11 : panneau / barrière / damier aperçus de loin -> on ralentit à ça (arrêt plus court et précis) ; 0 = non
+    approach_time: 0.8          # s à vitesse réduite après la dernière fois où on les a vus
+    kp: 2.5                       # 17/11 : 1.6 sortait dans les 3 virages à angle droit (rayon int. 12,5 cm) ; 2.5 : écart max 1,6-4 cm en simu
     kd: 2.0
     max_ang: 1.5
-    stop_sign_area: 0.008       # augmenter = s'arrête plus près du panneau (0.008 ~ 15 cm avant, 0.012 ~ 8 cm)
+    stop_sign_area: 0.06          # 17/11 après-midi : sur la photo « arrêt voulu » (11-56-51) le STOP fait 0.0158 ; 0.014 = on déclenche ~2-3 cm avant (le robot glisse un peu)
     stop_sign_wait: 3.0         # panneau STOP sur le côté : arrêt de X s puis on repart (0.0 = arrêt définitif)
-    stop_sign_edge: 0.10        # panneau à moins de ça d'un bord de l'image (il va sortir du champ) = on s'arrête aussi ; 0 = désactivé
-    stop_sign_min_area: 0.0015  # ... à condition qu'il fasse au moins cette taille
+    stop_sign_edge: 0.0           # panneau à moins de ça d'un bord de l'image (il va sortir du champ) = on s'arrête aussi ; 0 = désactivé
+    stop_sign_min_area: 0.008   # ... à condition qu'il fasse déjà au moins ça (avant 0.0015 : arrêt bien trop tôt)
+    stop_sign_overrun: 0.05     # panneau sorti de l'image avant d'atteindre stop_sign_area : rouler encore jusqu'à X m (moins s'il est déjà gros) ; 0 = arrêt tout de suite
     stop_sign_side: 0.15        # « sur le côté » = centre du panneau à plus de ça du milieu de l'image (fraction de largeur)
-    checker_count: 1            # s'arrêter au N-ième damier ; 0 = ignorer les damiers (arrêt au panneau STOP)
-    checker_overrun: 0.06       # m parcourus après avoir vu le damier (caméra -> avant du robot)
+    checker_count: 1              # s'arrêter au N-ième damier ; 0 = ignorer les damiers (arrêt au panneau STOP)
+    checker_after: 0.30         # 17/11 : pas de damier sur les X premiers m (le cercle blanc de départ passait pour un damier)
+    checker_rush_speed: 0.22      # 17/11 course : damier vu -> traversé à cette vitesse (max robot 0.22) ; 0 = arrêt avant (checker_overrun)
+    checker_cross_dist: 0.3       # m roulés après la détection avant l'arrêt (damier + longueur du robot) : à régler sur place
+    checker_overrun: 0.0          # 17/11 après-midi : arrêt voulu JUSTE AVANT le damier (photo 11-57-07, damier en bas de l'image) -> arrêt dès qu'il est confirmé
     barrier_lidar_dist: 0.22
-    barrier_cam_bottom: 0.45    # bas de la barrière dans l'image (0 haut..1 bas) : plus grand = s'arrête plus près
-    priority_range: 0.70
+    barrier_cam_bottom: 0.55      # 17/11 : 0.45 -> 0.55, plus près (simu, planche 6-12 cm de haut : 5-8 cm au lieu de 17-19) ; À REVÉRIFIER avec la barrière du concours
+    priority_range: 0.7
     priority_sector_deg: [-110.0, -20.0]
+    priority_max_width: 0.3       # 17/11 : robot 2 = petit objet isolé au LiDAR (on ne voit que son haut) ; plus large = mur, ignoré
+    priority_max_wait: 10.0       # robot 2 immobile à droite : on passe au bout de X s si la voie devant est libre (0 = attendre tant qu'il est là)
     lane:
-      roi_top: 0.55
-      yellow_lo: [25, 93, 95]       # réglé sur la piste le 05/11 ; V min 118 -> 95 (marge pour les zones sombres)
-      yellow_hi: [90, 255, 242]
-      white_lo: [55, 11, 165]       # réglé sur la piste le 05/11 ; V min 189 -> 165 (sol <= ~130, bande ~200)
-      white_hi: [148, 72, 255]
+      lookahead: 0.35
+      roi_top: 0.65               # 17/11 : ligne de détection plus basse (avant 0.55, voyait trop loin)
+      yellow_lo: [18, 70, 110]      # 17/11, piste du concours (sol noir, bandes très lumineuses V~250) ; avant [25, 93, 95]
+      yellow_hi: [45, 255, 255]     # avant [90, 255, 242] : V max 242 ratait le cœur de la bande
+      white_lo: [0, 0, 170]         # 17/11 : blanc = S < 70 et V > 170, toute teinte (sol noir V <= ~135) ; avant [55, 11, 165]
+      white_hi: [180, 70, 255]      # avant [148, 72, 255]
       lane_width_frac: 0.6
       center_offset: 0.0
       # Luminosité (V) médiane du sol dans la zone utile le jour où les seuils ci-dessus ont été réglés.
       # Si la salle est plus sombre / plus claire, l'image est ramenée à ce niveau avant d'appliquer
       # les seuils (bandes + damier). 0.0 = apprise au départ ; -1.0 = pas de correction.
-      floor_v_ref: 107.0
+      checker_v_max: 120            # 17/11 : cases noires du damier du concours = gris brillant V 70-110 (sol 30-60, blanc ~250) ; avant 80
+      checker_min_transitions: 6    # 17/11 : 4 -> 6 ; un cercle/une trace blanche au sol donne 4 transitions, un vrai damier bien plus
+      floor_v_ref: 65.0             # 17/11, sol noir du concours (V médian ~60-73) ; 107 = ancien sol gris, éclaircissait l'image x1,8
     barrier:                    # couleur de la barrière (planche bleu foncé sur la vraie piste)
-      lo: [90, 120, 20]
-      hi: [130, 255, 170]
+      lo: [104, 130, 70]          # 17/11 midi : planche du concours H~110 S~240 V~113 ; le sol bleu foncé (H~102, V~35)
+      hi: [125, 255, 255]         # déclenchait une fausse barrière à 10:50 -> teinte min 95 -> 104. Avant : [95,120,75]-[130,255,235]
+      y_top: 0.30                 # ignorer le haut de l'image (0..1) : la salle au-dessus de la piste n'est pas la barrière
     red:                        # panneau STOP : seuils larges, c'est la forme (disque + barre) qui trie
       lo: [170, 90, 40]
       hi: [10, 255, 255]
@@ -44,33 +68,45 @@ track_mission:
 enclosure_mission:
   ros__parameters:
     speed: 0.15
-    robot_radius: 0.12          # marge normale (demi-largeur 0.089 + 3 cm)
-    min_radius: 0.10            # marge mini quand le robot est bloqué dans un passage étroit
+    robot_radius: 0.11          # marge normale (demi-largeur 0.089 + 2 cm ; 0.12 avant le 18/11)
+    min_radius: 0.095           # marge mini quand le robot est bloqué dans un passage étroit (0.10 avant le 18/11)
+    body_radius: 0.09           # frein avant : disque « dur » (demi-largeur 0.089 ; 0.095 avant le 18/11)
+    box_robot_r: 0.10           # boîte connue : marge visée par le chemin (0.105 avant le 18/11)
+    box_min_r: 0.095            # boîte connue : marge jamais en dessous (avant : descendait à 0.075 -> frottait les murs)
     door_side_dist: 0.50        # entrée détectée : un montant à moins de ça de chaque côté (et écart total <= door_max_width + 0.10)
     scan_fill_time: 1.2         # s : un faisceau LiDAR sans écho reprend sa dernière mesure si elle est plus récente (tours tronqués du LDS-01) ; 0 = non
     entry_pass: 0.20            # m parcourus après la ligne des montants = entré dans l'enclos
     entrance_goal_deg: 0.0      # direction de l'entrée par rapport au cap de départ (+ = gauche)
     exit_extra: 0.20
-    detect_entrance_sign: false
+    detect_entrance_sign: true  # caméra AVANT d'entrer seulement : panneau tunnel (1 pt), coupée ensuite
     slam: true                  # carte + recalage des scans : la pose ne dérive plus avec les roues (false = odométrie brute)
     slam_max_w: 0.4             # rad/s : au-delà, le scan (déformé par la rotation) n'est pas utilisé par le SLAM
     entry_close_dist: 0.35      # m : une fois à cette distance de l'entrée, elle est « murée » pour le planificateur (0.0 = non)
     use_planner: true           # dans l'enclos : carte des murs + chemin calculé (false = ancien pilotage réactif)
     lookahead_dist: 0.22        # m : point visé sur le chemin
-    door_min_width: 0.25        # largeur d'un trou du contour accepté comme porte
-    door_max_width: 0.75
+    door_min_width: 0.18        # largeur d'un trou du contour accepté comme porte (17/11 : vraie sortie 25 cm, mesurée 0.22-0.27)
+    door_max_width: 0.50
+    straight_entry: true        # 17/11 : entrée tout droit au cap du départ (entrée de 25 cm au bout de la piste)
+    straight_speed: 0.08
+    straight_side_dist: 0.25    # montant à moins de ça des deux côtés = dans la porte
+    straight_max_dist: 2.5      # m tout droit au plus, puis on se considère entré
+    entry_min_width: 0.18       # trou de l'entrée visé (vraie entrée 25 cm)
+    entry_max_width: 0.45
+    sign_timeout: 8.0           # s à attendre le panneau tunnel avant de partir quand même (5 s : raté 2 fois sur 5 le 17/11)
+    sensor_timeout: 1.0         # s sans scan -> arrêt (le LDS-01 du robot 9 tombe à ~3 Hz, 0.6 coupait en vrai)
     entry_exclusion: 0.45       # une porte à moins de ça de l'entrée = l'entrée, pas la sortie
     exit_goal_dist: 0.30        # but visé derrière la porte de sortie
     exit_pass: 0.10             # m au-delà de la ligne de porte = sorti
 
 storage_mission:
   ros__parameters:
+    speed: 0.1
     image_topic: /camera/image_raw/compressed
     compressed: true
-    zones_side: left            # côté des zones par rapport au cap de départ
-    first_zone_dist: 0.20
-    zone_spacing: 0.30
-    approach_dist: 0.20
+    zones_side: right           # côté des zones par rapport au cap de départ (toujours à droite au concours)
+    first_zone_dist: 0.2
+    zone_spacing: 0.23
+    approach_dist: 0.11
     place_extra: 0.0
     leave_dist: 0.25            # m au-delà de la dernière zone pour sortir de la zone de stockage
     sign_x_range: [0.25, 0.75]  # bande centrale de l'image où lire le panneau

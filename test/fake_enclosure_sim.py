@@ -9,6 +9,18 @@
   --obstacles N   : nombre d'obstacles (3 par défaut, 0 = vide)
   --level         : réalisme du robot et du LiDAR (voir sim_core.py), « real » par défaut
   --view          : fenêtre vue de dessus (murs, obstacles, points LiDAR, trajectoire)
+  --approach      : épreuve 4 « en vrai » : départ sur la piste, 0,8-1,2 m avant l'entrée (décalé,
+                    pas forcément dans l'axe), avec --pylons N pylônes (2 par défaut) entre le
+                    départ et l'entrée, à contourner
+  --cable         : câble ethernet qui part au-dessus du robot : vu par le LiDAR comme un écho fin
+                    à 13-18 cm + un secteur sans écho (0), qui bougent avec le robot (le câble
+                    traîne et se balance)
+  --concours      : enclos du concours (17/11) : entrée et sortie de 25 cm, départ sur la piste dans
+                    l'axe de l'entrée 0,5-1,0 m avant, 5 à 9 pylônes de 4,5 cm de diamètre dans
+                    l'enclos (au lieu des obstacles)
+  --boite         : avec --concours : l'enclos du concours mesuré (18/11) : entrée sur le grand mur
+                    (1,25 m) collée au coin droit, 1 m de profondeur, sortie sur le mur de gauche à
+                    25 cm (bord) du mur d'entrée ; départ 0,5 m devant l'entrée (= test/make_box_map.py)
   --track         : une piste (jaune/blanche, 1 m, damier au bout) part de la sortie, avec la
                     caméra du simulateur de piste : il faut la suivre et s'arrêter sur le damier
                     (enclosure_mission handoff:=true + track_mission start_topic:=...)
@@ -123,8 +135,8 @@ def passable(lay, obs, clearance=ROBOT_R + 0.015, res=0.01):
     """Existe-t-il un chemin du départ à la sortie pour un disque de rayon `clearance` ?
     (parcours en largeur sur une grille ; évite de générer des enclos impossibles)"""
     from collections import deque
-    x0, y0 = -0.6, -0.5
-    nx, ny = int((lay.W + 1.2) / res), int((lay.H + 1.0) / res)
+    x0, y0 = -1.5, -0.5
+    nx, ny = int((lay.W + 2.1) / res), int((lay.H + 1.0) / res)
     xs = x0 + (np.arange(nx) + 0.5) * res
     ys = y0 + (np.arange(ny) + 0.5) * res
     X, Y = np.meshgrid(xs, ys, indexing='ij')
@@ -138,6 +150,8 @@ def passable(lay, obs, clearance=ROBOT_R + 0.015, res=0.01):
         free &= np.hypot(X - cx, Y - cy) > r + clearance
     inside = (X > 0) & (X < lay.W) & (Y > 0) & (Y < lay.H)
     corridor = (X <= 0) & (Y > lay.entry[0]) & (Y < lay.entry[1])
+    if getattr(lay, 'approach', False):   # départ sur la piste : tout le devant de l'enclos
+        corridor = (X <= 0) & (X > -1.45) & (Y > -0.3) & (Y < lay.H + 0.3)
     a0, a1 = lay.exit
     beyond = {'bottom': (Y <= 0) & (X > a0) & (X < a1), 'top': (Y >= lay.H) & (X > a0) & (X < a1),
               'right': (X >= lay.W) & (Y > a0) & (Y < a1)}[lay.exit_wall]
@@ -161,8 +175,9 @@ def passable(lay, obs, clearance=ROBOT_R + 0.015, res=0.01):
     return False
 
 
-def random_obstacles(rng, lay, n):
-    obs = []
+def random_obstacles(rng, lay, n, fixed=()):
+    obs = list(fixed)
+    n += len(obs)
     ex, ey = lay.exit_point()
     for _ in range(500):
         if len(obs) >= n:
@@ -172,6 +187,104 @@ def random_obstacles(rng, lay, n):
             continue  # pas collé à une porte
         if all(math.hypot(x - ox, y - oy) > 0.35 for ox, oy, _ in obs) and passable(lay, obs + [(x, y, r)]):
             obs.append((x, y, r))
+    return obs
+
+
+def approach_setup(rng, lay, n):
+    """Départ loin devant l'entrée + pylônes (disques de 3-4 cm de rayon à hauteur du LiDAR) entre
+    le départ et l'entrée, dont un en général presque dans l'axe."""
+    ey = sum(lay.entry) / 2
+    lay.approach = True
+    lay.start = (-rng.uniform(0.8, 1.2), ey + rng.uniform(-0.20, 0.20), math.radians(rng.uniform(-10, 10)))
+    sx, sy, _ = lay.start
+    pyl = []
+    if sx + 0.30 > -0.45:
+        return pyl
+    for _ in range(500):
+        if len(pyl) >= n:
+            break
+        x = rng.uniform(sx + 0.30, -0.45)   # pas collé à l'entrée (au moins 45 cm devant)
+        # le premier presque sur la ligne départ -> entrée, les autres autour
+        t = (x - sx) / (0 - sx)
+        y = sy + t * (ey - sy) + (rng.uniform(-0.08, 0.08) if not pyl else rng.uniform(-0.45, 0.45))
+        r = rng.uniform(0.03, 0.04)
+        if math.hypot(x - sx, y - sy) < 0.28 or math.hypot(x, y - ey) < 0.30:
+            continue
+        if all(math.hypot(x - px, y - py) > 0.32 for px, py, _ in pyl):
+            pyl.append((x, y, r))
+    return pyl
+
+
+class Cable:
+    """Câble attaché au robot, au-dessus du LiDAR : direction (repère robot) qui se balance lentement
+    autour d'un angle tiré au hasard ; un écho fin (2-3 faisceaux à 13-18 cm) et un secteur sans écho
+    de 10-25° à côté (le câble qui passe sur la tête du LiDAR)."""
+
+    def __init__(self, rng):
+        self.rng = rng
+        # un câble qui part au-dessus du robot traîne derrière lui ; ROBOTHUB_SIM_CABLE_ANY=1 : n'importe
+        # où, devant compris (pire cas : 25-50° aveugles devant)
+        self.base = rng.uniform(0, 360) if os.environ.get('ROBOTHUB_SIM_CABLE_ANY') else rng.uniform(110, 250)
+        self.amp = rng.uniform(10, 40)
+        self.per = rng.uniform(4, 10)
+        self.blind = rng.uniform(10, 25)
+        self.dist = rng.uniform(0.13, 0.18)
+        print(f'câble : vers {self.base:.0f}° ±{self.amp:.0f}°, écho à {self.dist:.2f} m, '
+              f'secteur aveugle {self.blind:.0f}°', flush=True)
+
+    def apply(self, ranges, t, yaw_rate):
+        r = list(ranges)
+        c = self.base + self.amp * math.sin(2 * math.pi * t / self.per) - 8 * yaw_rate   # traîne en tournant
+        for k in range(-1, 2):
+            if self.rng.random() < 0.85:
+                r[int(round(c + k)) % 360] = self.dist + self.rng.normal(0, 0.005)
+        for k in range(2, 2 + int(self.blind)):
+            r[int(round(c + k)) % 360] = 0.0
+        return r
+
+
+def concours_layout(rng):
+    W, H = rng.uniform(1.3, 1.7), rng.uniform(0.9, 1.2)
+    ew = xw = 0.25
+    ey = rng.uniform(0.25, H - 0.25)
+    wall = rng.choice(['bottom', 'right', 'top'], p=[0.5, 0.25, 0.25])
+    span = H if wall == 'right' else W
+    lo = 0.6 if wall != 'right' else 0.15
+    xc = rng.uniform(lo + xw / 2, span - 0.12 - xw / 2)
+    lay = Layout(W, H, ey, ew, str(wall), xc, xw)
+    lay.start = (-rng.uniform(0.5, 1.0), ey, 0.0)
+    return lay
+
+
+def boite_layout():
+    """Enclos du concours mesuré, mêmes cotes par défaut que test/make_box_map.py (repère du simu :
+    entrée sur le mur x=0, robot vers +x, sa gauche = +y ; mur « top » = côté gauche du robot)."""
+    depth, width, entry_pos, exit_pos = 1.0, 1.25, 0.125, 0.375
+    lay = Layout(depth, width, entry_pos, 0.25, 'top', exit_pos, 0.25)   # top = mur de gauche
+    # ROBOTHUB_SIM_START_DY : départ décalé (m, + = à gauche de l'axe de l'entrée) ; 18/11 en vrai : porte vue
+    # 3-7 cm à droite, le robot finissait contre le montant droit
+    lay.start = (-0.50, entry_pos + float(os.environ.get('ROBOTHUB_SIM_START_DY', 0) or 0), 0.0)
+    return lay
+
+
+def concours_pylons(rng, lay):
+    """5 à 9 pylônes de 4,5 cm de diamètre répartis au hasard dans l'enclos (passage toujours possible)."""
+    # ROBOTHUB_SIM_PYLON_SEED : pylônes tirés autrement (même enclos) = obstacles qui ont bougé depuis la carte
+    if os.environ.get('ROBOTHUB_SIM_PYLON_SEED'):
+        rng = np.random.default_rng(int(os.environ['ROBOTHUB_SIM_PYLON_SEED']))
+    n = int(rng.integers(5, 10))
+    if os.environ.get('ROBOTHUB_SIM_PYLONS'):   # nombre de pylônes imposé (0 = parties 1-2 du règlement)
+        n = int(os.environ['ROBOTHUB_SIM_PYLONS'])
+    ex, ey = lay.exit_point()
+    obs = []
+    for _ in range(2000):
+        if len(obs) >= n:
+            break
+        x, y = rng.uniform(0.15, lay.W - 0.15), rng.uniform(0.15, lay.H - 0.15)
+        if math.hypot(x, y - sum(lay.entry) / 2) < 0.30 or math.hypot(x - ex, y - ey) < 0.25:
+            continue
+        if all(math.hypot(x - ox, y - oy) > 0.25 for ox, oy, _ in obs) and passable(lay, obs + [(x, y, 0.0225)]):
+            obs.append((x, y, 0.0225))
     return obs
 
 
@@ -243,6 +356,7 @@ class Sim(Node):
         shapes = [sim_core.shape_line([(w[0], w[1]), (w[2], w[3])], '#222222', 0.02) for w in lay.walls]
         shapes += [{'t': 'circle', 'center': [float(cx), float(cy)], 'r': float(rr), 'c': '#6b4a1e', 'fill': '#b98c4a'}
                    for cx, cy, rr in obstacles]
+        self.cable = Cable(rng) if '--cable' in sys.argv else None
         ext = 0.45
         if self.track is not None:   # piste après la sortie
             ext = TRACK_LEN + 0.25
@@ -251,7 +365,7 @@ class Sim(Node):
             shapes += [sim_core.shape_line([p0 + nrm, p0 + nrm + d * TRACK_LEN], '#c9a800', 0.02),
                        sim_core.shape_line([p0 - nrm, p0 - nrm + d * TRACK_LEN], '#9aa0a6', 0.02),
                        sim_core.shape_line([p0 + nrm + d * TRACK_LEN, p0 - nrm + d * TRACK_LEN], '#222222', 0.04)]
-        self.traj = sim_core.TrajLog((-0.5, -ext if lay.exit_wall == 'bottom' else -0.15,
+        self.traj = sim_core.TrajLog((-1.3 if getattr(lay, 'approach', False) else -0.5, -ext if lay.exit_wall == 'bottom' else -0.15,
                                       lay.W + (ext if lay.exit_wall == 'right' else 0.15),
                                       lay.H + (ext if lay.exit_wall == 'top' else 0.15)), shapes)
         self.on_track = False
@@ -265,7 +379,7 @@ class Sim(Node):
         self.view = None
         if '--view' in sys.argv:
             from sim_view import TopView
-            self.view = TopView('enclos', -0.6, lay.W + 0.4, -0.5, lay.H + 0.4, 300)
+            self.view = TopView('enclos', -1.3 if getattr(lay, 'approach', False) else -0.6, lay.W + 0.4, -0.5, lay.H + 0.4, 300)
             self.create_timer(0.1, self.draw)
 
     def on_cmd(self, m):
@@ -290,7 +404,7 @@ class Sim(Node):
             self.check_track()
         elif self.lay.exited(self.x, self.y):
             self.end(f'SUCCESS t={self.t:.1f}s marge mini={self.min_clear * 100:.1f} cm')
-        if self.t > (150 if self.track is not None else 90):
+        if self.t > (150 if self.track is not None else float(os.environ.get('ROBOTHUB_SIM_TMAX', 90))):
             self.end(f'TIMEOUT t={self.t:.0f}s position ({self.x:.2f}, {self.y:.2f})')
         self.odom_pub.publish(r.odom_msg())
 
@@ -328,12 +442,16 @@ class Sim(Node):
         m.range_min, m.range_max = 0.12, 3.5
         m.scan_time = 0.2
         rs = []
+        # ROBOTHUB_SIM_LIDAR_YAW (°) : LiDAR monté de travers (le faisceau « 0° » part de ce côté, + = gauche)
+        off = math.radians(float(os.environ.get('ROBOTHUB_SIM_LIDAR_YAW', 0) or 0))
         for i in range(360):
-            a = self.yaw + math.radians(i)
+            a = self.yaw + math.radians(i) + off
             dx, dy = math.cos(a), math.sin(a)
             rs.append(min([ray_segment(self.x, self.y, dx, dy, s) for s in self.lay.walls] +
                           [ray_circle(self.x, self.y, dx, dy, c) for c in self.obs]))
         m.ranges = sim_core.lidar_effects(rs, self.level, self.rng)
+        if self.cable is not None:
+            m.ranges = self.cable.apply(m.ranges, self.t, self.w)
         self.scan_pub.publish(m)
         self.scan_pts = [(self.x + d * math.cos(self.yaw + math.radians(i)),
                           self.y + d * math.sin(self.yaw + math.radians(i))) for i, d in enumerate(m.ranges) if d > 0]
@@ -369,8 +487,16 @@ def main():
     rng = np.random.default_rng(seed)
     layout = argv[argv.index('--layout') + 1] if '--layout' in argv else ('random' if '--seed' in argv else 'fixed')
     lay = FIXED if layout == 'fixed' else random_layout(rng)
+    if '--concours' in argv:
+        lay = boite_layout() if '--boite' in argv else concours_layout(rng)
     n_obs = int(argv[argv.index('--obstacles') + 1]) if '--obstacles' in argv else 3
-    obs = random_obstacles(rng, lay, n_obs)
+    pyl = []
+    if '--approach' in argv:
+        import copy
+        lay = copy.copy(lay)
+        n_pyl = int(argv[argv.index('--pylons') + 1]) if '--pylons' in argv else 2
+        pyl = approach_setup(rng, lay, n_pyl)
+    obs = concours_pylons(rng, lay) if '--concours' in argv else random_obstacles(rng, lay, n_obs, pyl)
     rclpy.init()
     node = Sim(lay, obs, level, rng)
     print(f'{lay.describe()} | niveau={level.name} seed={seed}', flush=True)
